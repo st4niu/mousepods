@@ -397,6 +397,7 @@ a.tile:hover{background:color-mix(in srgb,var(--card) 88%,var(--text))}
 .fc-head .ti{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;flex:none;background:var(--accent);color:var(--on-accent)}
 .fc-head .ti svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .fcard>.seg{display:grid;width:100%}
+.fcard.wide{margin-top:14px}
 .covers{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
 .cover{position:relative;border-radius:10px;overflow:hidden;aspect-ratio:460/215;display:grid;place-items:center;text-decoration:none;
   color:var(--text);background:var(--btn)}
@@ -530,6 +531,13 @@ a.lrow:hover,button.lrow:hover{background:var(--line)}
       <div class="covers" id="hx-games"></div>
     </section>
   </div>
+  <section class="fcard wide" aria-labelledby="hx-sp-h">
+    <div class="fc-head"><span class="ti"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg></span>
+      <label class="lt" for="hx-sp"><h2 id="hx-sp-h" data-i18n="v2.spatial">Spatial audio</h2><small id="hx-sp-st" data-i18n="v2.spatial_hint">The sound stays in place in the room while you turn your head</small></label>
+      <label class="sw"><input type="checkbox" id="hx-sp" data-k="spatial_audio.enabled" aria-label="Spatial audio"><span></span></label></div>
+    <div class="row"><button type="button" class="btn sm" data-spatial-test data-i18n="v2.spatial_test">Play a test sound</button><small class="hint" data-i18n="v2.spatial_test_hint">A chime walks around your head: turn your head while it plays.</small></div>
+    <small class="hint" data-i18n="v2.spatial_how">Play anything (Spotify, YouTube, games) to the “MousePods Spatial” output: it becomes 3D in your AirPods and stays in front of your screen.</small>
+  </section>
   <h2 class="sec" data-i18n="v2.try_it">Try it</h2>
   <div class="tryrow">
     <a class="pic" href="/demo" target="_blank" rel="noopener"><img src="/media/cockpit.jpg" alt="" loading="lazy"><span class="cap"><b data-i18n="v2.cockpit">Cockpit demo</b><small data-i18n="v2.cockpit_hint">Look around a 3D cockpit with your head</small></span><span class="ext"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></span></a>
@@ -625,6 +633,15 @@ a.lrow:hover,button.lrow:hover{background:var(--line)}
     <div class="set toggle"><label for="st-autostart" data-i18n-html="v2.autostart">Start MousePods at login<small>hidden, in the tray</small></label><label class="sw"><input type="checkbox" id="st-autostart"><span></span></label></div>
     <div class="set toggle"><label data-i18n="settings.notifications">Notifications</label><label class="sw"><input type="checkbox" data-k="notifications"><span></span></label></div>
     <div class="kv"><span data-i18n="v2.welcome_again">Welcome guide</span><span><button class="btn sm" data-go="welcome" data-i18n="v2.open">Open</button></span></div>
+  </div>
+  <h2 data-i18n="v2.spatial">Spatial audio</h2>
+  <div class="card classic-gap">
+    <div class="set toggle"><label data-i18n-html="v2.spatial_enable">Spatial audio<small>a virtual 7.1 output, rendered in 3D in your earbuds</small></label><label class="sw"><input type="checkbox" data-k="spatial_audio.enabled"><span></span></label></div>
+    <div class="set toggle"><label data-i18n-html="v2.spatial_head">Head tracking<small>off: the sound turns with your head, like normal headphones</small></label><label class="sw"><input type="checkbox" data-k="spatial_audio.head_tracking"><span></span></label></div>
+    <div class="set"><label data-i18n-html="v2.spatial_width">Width<small>angle of the front speakers, degrees</small></label><input type="range" data-k="spatial_audio.width" min="10" max="60" step="1"><output></output></div>
+    <div class="set toggle"><label data-i18n-html="v2.spatial_default">Use it as the default output<small>the previous output comes back when spatial audio is off</small></label><label class="sw"><input type="checkbox" data-k="spatial_audio.make_default"><span></span></label></div>
+    <div class="kv"><span data-i18n="v2.spatial_test_label">Test</span><span><button type="button" class="btn sm" data-spatial-test data-i18n="v2.spatial_test">Play a test sound</button></span></div>
+    <div class="hint" id="st-sp-st" style="padding:10px 0 2px"></div>
   </div>
   <h2 class="adw-only" data-i18n="settings.sensitivity">Sensibilité</h2>
   <div class="card"><h3 class="classic-only" data-i18n="settings.sensitivity">Sensibilité</h3>
@@ -1058,6 +1075,7 @@ function renderHero(tm){
     :[tm.connected?t("v2.connected_idle"):(tm.status||t("js.ov.searching"))];
   setText($("#hx-status"),parts.filter(Boolean).join(" · "));
   const hero=$(".hero");if(hero.classList.contains("live")!==!!live)hero.classList.toggle("live",!!live);
+  setText($("#hx-sp-st"),spatialText(tm.spatial));
   setText($("#hx-t-mode"),({souris:t("overview.mouse"),pointeur:t("overview.pointer"),glisse:t("overview.glide")})[tm.mode]||"—");
   setText($("#hx-t-src"),SRC(tm.source)||"—");
   const bats=(tm.battery||[]).filter(b=>b.state!=="disconnected");
@@ -1068,6 +1086,9 @@ function renderHero(tm){
   setText($("#hx-src-hint"),`${t("js.ov.detected",{place:({ear:t("js.place.ear"),case:t("js.place.case"),out:t("js.place.out")})[tm.place]||"—"})} → ${t("js.source_src",{src:SRC(tm.source)})}`);
   setText($("#hx-scroll"),tm.scroll?t("v2.on"):t("v2.off"));
   const g=tm.gestures;setText($("#hx-gest"),g?(g.enabled?t("v2.on"):t("v2.off")):"—")}
+function spatialText(sp){if(!sp)return t("v2.spatial_hint");
+  if(sp.active)return t("v2.spatial_on",{output:sp.output||"—"});
+  if(sp.error)return t("v2.spatial_err",{error:sp.error});return t("v2.spatial_hint")}
 function renderHeroState(s){const name=(s.info||[]).find(i=>i.key==="info.name");
   setText($("#hx-name"),ANON?(s.model||"AirPods"):(name?name.value:(s.model||"AirPods")));
   setText($("#hx-calib"),s.profile_key?(s.calibrated?t("v2.calib_done",{profile:s.profile_key}):t("js.calib.todo")):"—");
@@ -1085,6 +1106,8 @@ function loadAutostart(){fetch("/api/autostart").then(r=>r.json()).then(j=>{$("#
 $("#st-autostart").onchange=e=>post("/api/autostart",{enabled:e.target.checked}).then(r=>r.json()).then(j=>{
   if(j.error){toast(j.error);loadAutostart()}else toast(t("js.toast.saved"))}).catch(()=>loadAutostart());
 // what's new: a banner in the new look (the classic look keeps its dialog)
+$$("[data-spatial-test]").forEach(b=>b.onclick=()=>post("/api/spatial/test").then(r=>r.json()).then(j=>
+  toast(j.error||t("v2.spatial_test_toast"))).catch(()=>toast(t("v2.spatial_test_err"))));
 $("#banner-open").onclick=()=>{$("#banner").hidden=true;const d=$("#news-dlg");if(d.dataset.version&&!d.open)d.showModal()};
 $("#banner-close").onclick=()=>{$("#banner").hidden=true;const d=$("#news-dlg"),ver=d.dataset.version;if(!ver)return;
   delete d.dataset.version;if(VER)VER.whats_new=null;post("/api/version",{seen:ver})};
@@ -1181,6 +1204,7 @@ let rateShownAt=0,ratePage=null;
 function renderTelemetry(){
   const tm=T;const ok=tm.connected&&tm.live;
   if(LOOK.skin==="adwaita"){renderPagebar(tm);if(page==="overview")renderHero(tm)}
+  if(page==="settings")setText($("#st-sp-st"),spatialText(tm.spatial));
   setClass($("#side-dot"),"dot "+(ok?"ok":tm.connected?"warn":""));
   setText($("#side-status"),ok?t("js.status.live"):(tm.status||"—"));
   renderWizard();

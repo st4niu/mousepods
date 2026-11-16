@@ -749,6 +749,7 @@ class WebUI:
             "gestures": self._gest_summary(),
             "speech": self.speech.as_dict() if self.speech else None,
             "pose": self._pose(),
+            "spatial": self.ctl.spatial_status() if hasattr(self.ctl, "spatial_status") else None,
         }
 
     def _pose(self):
@@ -1036,6 +1037,13 @@ class WebUI:
                     ui.q.put(("control", int(body["ident"]), body.get("values", [])))
                 elif self.path == "/api/raw":
                     ui.q.put(("raw", str(body.get("hex", ""))))
+                elif self.path == "/api/spatial/test":     # chime walking around the head
+                    if not (getattr(ui.ctl, "spatial", None) and ui.ctl.spatial_status().get("active")):
+                        return self._json({"error": tr("srv.error.spatial_off"), "code": "spatial_off"}, 409)
+                    import spatial_test
+                    err = spatial_test.play(m.data_dir())
+                    if err:
+                        return self._json({"error": err}, 500)
                 elif self.path == "/api/reconnect":
                     ui.q.put(("reconnect",))
                 elif self.path == "/api/record":

@@ -47,6 +47,14 @@ from i18n import tr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(HERE, "config.json")
+
+
+def data_dir():
+    """Writable data folder: $MOUSEPODS_DATA_DIR in the Flatpak, else ~/.local/share/mousepods."""
+    d = os.environ.get("MOUSEPODS_DATA_DIR") or os.path.join(
+        os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "mousepods")
+    os.makedirs(d, exist_ok=True)
+    return d
 CTRL_SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "airpods-mouse.sock")
 WINDOWS = sys.platform == "win32"
 CTRL_UDP = ("127.0.0.1", 8736)     # Windows has no AF_UNIX datagram sockets: --send uses loopback UDP there
@@ -133,6 +141,9 @@ DEFAULTS = {
     # --- OpenTrack (suivi de tête pour simulateurs, voir opentrack_out.py et docs/OPENTRACK.md)
     # --- other headsets: Android's standard head-tracker HID (Sony XM5/XM6, Pixel Buds Pro…), see hid_headtracker.py
     "headsets": {"enabled": True, "mouse": True, "px_per_deg": 22.0},
+    # head-tracked spatial audio (spatial_audio.py): a virtual 7.1 output rendered with an HRTF onto
+    # the AirPods, whose speakers stay in place while the head turns
+    "spatial_audio": {"enabled": False, "head_tracking": True, "width": 30.0, "make_default": True},
     "opentrack": {"enabled": False, "host": "127.0.0.1", "port": 4242, "rate_hz": 120,
                   "invert_yaw": False, "invert_pitch": False, "invert_roll": False,
                   "scale_yaw": 1.0, "scale_pitch": 1.0, "scale_roll": 1.0, "smoothing": 0.2,
@@ -996,6 +1007,7 @@ class Controller:
         self.cfg_path = cfg_path
         self.ptr = pointer
         self.headsets = None         # hid_headtracker.Manager (other headsets), started by run()
+        self.spatial = None          # spatial_audio.SpatialAudio while spatial audio is on
         self._hs_last = {}           # headset name -> (yaw, pitch) of the previous sample, for the mouse
         self.diag = diag
         self.pid = "0000"
@@ -1079,6 +1091,7 @@ class Controller:
             self._make_filters()
             self._load_profile()
             self.sync_opentrack()
+            self.sync_spatial()
             if self.cfg["mode"] != old_mode:
                 self.recenter(quiet=True)
             log.info("Réglages rechargés")
@@ -1192,6 +1205,9 @@ class Controller:
         ot = self.opentrack
         if ot:
             ot.feed_angles(yaw, pitch, roll, dt, yaw_rate)
+            sp = self.spatial
+            if sp is not None and ot.pose:
+                sp.set_pose(ot.pose[3], ot.pose[4])
         hc = self.cfg.get("headsets", {})
         prev = self._hs_last.get(name)
         self._hs_last[name] = (yaw, pitch)
@@ -1238,7 +1254,49 @@ class Controller:
     # ---- OpenTrack (suivi de tête -> simulateurs) ------------------------------------------
     @property
     def opentrack_pauses_mouse(self):
-        return bool(self.opentrack) and self.cfg.get("opentrack", {}).get("pause_mouse_when_opentrack", True)
+        return (bool(self.opentrack) and getattr(self, "_ot_takes_head", True)
+                and self.cfg.get("opentrack", {}).get("pause_mouse_when_opentrack", True))
+
+    # ---- spatial audio (spatial_audio.py) -------------------------------------------------
+    def sync_spatial(self):
+        """Start, stop or reconfigure head-tracked spatial audio from the settings. Never raises:
+        a missing PipeWire piece is reported in spatial_status() instead."""
+        sa = self.cfg.get("spatial_audio") or {}
+        want = bool(sa.get("enabled"))
+        sp = getattr(self, "spatial", None)
+        key = (sa.get("width"), sa.get("make_default", True))
+        try:
+            if not want:
+                if sp:
+                    sp.stop()
+                    self.spatial = None
+                    log.info("Spatial audio: off")
+                return
+            if sp and getattr(self, "_spatial_key", None) == key:
+                return
+            if sp:                                    # settings that need a new graph
+                sp.stop()
+                self.spatial = None
+            import spatial_audio
+            ok, why = spatial_audio.available()
+            if not ok:
+                self._spatial_error = why
+                log.warning("Spatial audio unavailable: %s", why)
+                return
+            sp = spatial_audio.SpatialAudio(dict(sa), data_dir())
+            sp.start()
+            self.spatial, self._spatial_key, self._spatial_error = sp, key, None
+            log.info("Spatial audio: on (%s)", (sp.status() or {}).get("output"))
+        except Exception as e:  # noqa: BLE001  (audio must never take the mouse down)
+            self._spatial_error = str(e)
+            log.warning("Spatial audio failed: %s", e)
+
+    def spatial_status(self):
+        sp = getattr(self, "spatial", None)
+        st = dict(sp.status()) if sp else {"active": False}
+        if not sp and getattr(self, "_spatial_error", None):
+            st["error"] = self._spatial_error
+        return st
 
     def sync_opentrack(self):
         # called from the main loop (config reload) and from web threads (calibration start/end)
@@ -1259,7 +1317,13 @@ class Controller:
         want_games = any((g or {}).get("enabled") for g in games_cfg.values())
         want_calib = getattr(self, "calibration", None) is not None   # calibration reads the head angle
         want_demo = time.monotonic() < getattr(self, "demo_until", 0.0)
-        if (want_udp or want_js or want_games or want_calib or want_demo) and not self.opentrack:
+        sa = self.cfg.get("spatial_audio") or {}
+        want_spatial = bool(sa.get("enabled") and sa.get("head_tracking", True))
+        # what pauses the mouse is a game / opentrack / joystick / calibration / demo taking the head,
+        # not spatial audio, which only reads the head angle
+        self._ot_takes_head = want_udp or want_js or want_games or want_calib or want_demo
+        want_udp_or_any = self._ot_takes_head or want_spatial
+        if want_udp_or_any and not self.opentrack:
             try:
                 import opentrack_out
                 try:
@@ -1275,7 +1339,7 @@ class Controller:
                     notify(self.cfg, tr("srv.status.opentrack_on"))
             except (OSError, ValueError) as e:
                 log.warning("OpenTrack indisponible : %s", e)
-        elif want_udp or want_js or want_games or want_calib or want_demo:
+        elif want_udp_or_any:
             if want_udp != self.opentrack.udp:
                 notify(self.cfg, tr("srv.status.opentrack_on") if want_udp else tr("srv.status.opentrack_off"))
             try:
@@ -1447,6 +1511,9 @@ class Controller:
             p = self.engine.p
             ot.feed(yaw, pitch, roll, dt, self.engine.g, self.engine.lat,
                     (p["pitch_sign"], p["roll_sign"], p["yaw_sign"]), att)
+            sp = self.spatial
+            if sp is not None and ot.pose:
+                sp.set_pose(ot.pose[3], ot.pose[4])
             if self.calibration is not None:
                 head = ot.head()
                 if head is not None:
@@ -1655,6 +1722,7 @@ def run(cfg, cfg_path, diag=False, web_port=8737, opentrack=False, joystick=Fals
     ctl.opentrack_forced = opentrack
     ctl.joystick_forced = joystick
     ctl.sync_opentrack()
+    ctl.sync_spatial()
     web = None
     if web_port:
         try:
@@ -1777,6 +1845,8 @@ def run(cfg, cfg_path, diag=False, web_port=8737, opentrack=False, joystick=Fals
             aap.close(stem_restore=stem_on)
         if web:
             web.stop()
+        if ctl.spatial:                # gives the previous default output back
+            ctl.spatial.stop()
         if ctl.opentrack:
             ctl.opentrack.stop()
         ptr.close()
