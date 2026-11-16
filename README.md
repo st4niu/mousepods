@@ -220,6 +220,14 @@ Tried it in another game? [Tell us](https://github.com/starman-tech/mousepods/is
 | macOS | ❌ not needed: Apple's own API already gives head tracking |
 | Android | ❌ not yet: needs a Bluetooth stack that allows the AirPods channel |
 
+## Spatial audio
+
+Like Apple's spatial audio, on Linux: switch **Spatial audio** on and play anything (Spotify,
+YouTube, games, films) through the **MousePods Spatial** output. It's rendered in 3D in your
+AirPods and stays in place in the room while you turn your head: stereo sounds like two speakers
+on your desk, 5.1 / 7.1 comes from all around. An intensity slider keeps music clear, and a test
+sound walks around your head. Guide and good things to try: [docs/SPATIAL_AUDIO.md](docs/SPATIAL_AUDIO.md).
+
 ## Head tracking for simulators
 
 AirPods 3 and AirPods Pro as a **TrackIR**: the in-game camera follows your head. Page **Simulateurs**

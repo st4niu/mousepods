@@ -134,6 +134,14 @@ Testé dans un autre jeu ? [Raconte-nous](https://github.com/starman-tech/mousep
 | macOS | ❌ inutile : l'API d'Apple donne déjà le suivi de tête |
 | Android | ❌ pas encore : il faut une pile Bluetooth qui autorise ce canal |
 
+## Son spatial
+
+Comme le son spatial d'Apple, sous Linux : active **Son spatial** et joue n'importe quoi (Spotify,
+YouTube, jeux, films) sur la sortie **MousePods Spatial**. Le son est rendu en 3D dans tes AirPods
+et reste fixe dans la pièce quand tu tournes la tête : la stéréo sonne comme deux enceintes sur ton
+bureau, le 5.1 / 7.1 vient de tout autour. Un curseur d'intensité garde la musique claire, et un son
+de test fait le tour de ta tête. Guide : [docs/SPATIAL_AUDIO.md](docs/SPATIAL_AUDIO.md).
+
 ## Suivi de tête pour simulateurs
 
 Les AirPods 3 et AirPods Pro comme un **TrackIR** : la caméra du jeu suit la tête. Page **Simulateurs**

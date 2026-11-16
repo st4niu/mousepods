@@ -12,6 +12,8 @@
     "--device=all",
     "--device=shm",
     "--allow=bluetooth",
+    "--filesystem=xdg-run/pipewire-0",
+    "--socket=pulseaudio",
     "--system-talk-name=org.bluez",
     "--talk-name=org.kde.StatusNotifierWatcher",
     "--filesystem=~/.local/share/Steam",

@@ -35,6 +35,17 @@
   </screenshots>
   <!-- newest first; a release tag needs an entry with a description (release_notes.py check) -->
   <releases>
+    <release version="1.5.0" date="2026-11-16">
+      <description>
+        <p>Spatial audio with head tracking.</p>
+        <ul>
+          <li>Spatial audio: a "MousePods Spatial" output renders anything you play (music, videos, games, 5.1 and 7.1 films) in 3D in your AirPods, and the sound stays in place in the room while you turn your head</li>
+          <li>Intensity slider, width, head tracking on or off, and a test sound that walks around your head</li>
+          <li>The HRTF (MIT KEMAR, 1.1 MB) is downloaded on first use</li>
+          <li>The Flatpak now has access to PipeWire and the sound server for this</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.4.0" date="2026-11-16">
       <description>
         <p>Games outside Steam, Star Citizen in one click.</p>

@@ -52,3 +52,7 @@ Head-tracker HID headsets (hid_headtracker.py): protocol details and axis mappin
 windows/aap-poc/bthcli/sys and windows/aap-poc/common are modified files from Microsoft's
 Windows-driver-samples (bluetooth/bthecho), Copyright (c) Microsoft Corporation, licensed under the
 Microsoft Public License (MS-PL), see windows/aap-poc/LICENSE-MS-PL.
+
+Spatial audio downloads, on first use, the MIT KEMAR HRTF measurements by Bill Gardner and Keith
+Martin (MIT Media Lab) in the SOFA format from sofacoustics.org; the file is not shipped with
+MousePods (hrtf_download.py, docs/SPATIAL_AUDIO.md).

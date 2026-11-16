@@ -1285,7 +1285,10 @@ class Controller:
                 sp.stop()
                 self.spatial = None
             import spatial_audio
-            ok, why = spatial_audio.available()
+            ok, why = spatial_audio.available(data_dir())
+            if not ok and spatial_audio.find_hrtf(data_dir()) is None:
+                self._fetch_hrtf()                 # first use: download it, then try again
+                return
             if not ok:
                 self._spatial_error = why
                 log.warning("Spatial audio unavailable: %s", why)
@@ -1297,6 +1300,25 @@ class Controller:
         except Exception as e:  # noqa: BLE001  (audio must never take the mouse down)
             self._spatial_error = str(e)
             log.warning("Spatial audio failed: %s", e)
+
+    def _fetch_hrtf(self):
+        """Download the HRTF once (hrtf_download.py), off the main loop, then start spatial audio."""
+        if getattr(self, "_hrtf_thread", None) and self._hrtf_thread.is_alive():
+            return
+        self._spatial_error = "downloading the HRTF (1.1 MB, first use)"
+
+        def work():
+            try:
+                import hrtf_download
+                hrtf_download.ensure(data_dir())
+                log.info("Spatial audio: HRTF downloaded")
+                self._spatial_error = None
+                self.sync_spatial()
+            except Exception as e:  # noqa: BLE001
+                self._spatial_error = f"HRTF download failed: {e}"
+                log.warning("Spatial audio: %s", self._spatial_error)
+        self._hrtf_thread = threading.Thread(target=work, name="hrtf download", daemon=True)
+        self._hrtf_thread.start()
 
     def spatial_status(self):
         sp = getattr(self, "spatial", None)
