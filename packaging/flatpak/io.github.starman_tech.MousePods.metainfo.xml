@@ -35,6 +35,16 @@
   </screenshots>
   <!-- newest first; a release tag needs an entry with a description (release_notes.py check) -->
   <releases>
+    <release version="1.4.0" date="2026-11-16">
+      <description>
+        <p>Games outside Steam, Star Citizen in one click.</p>
+        <ul>
+          <li>Games page: add a game outside Steam with its Wine prefix (Lutris, Heroic, Bottles, LUG Helper, plain Wine) and switch its head tracking on like a Steam game</li>
+          <li>Star Citizen and the other TrackIR "Enhanced" games get their table without switching them off and on</li>
+          <li>In the Flatpak, MousePods asks you to confirm a game outside Steam is closed before changing it</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.3.1" date="2026-11-16">
       <description>
         <p>Much lighter with the window open, and a nicer overview.</p>
