@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Install / remove the MousePods head-tracking DLLs in a Steam Proton prefix.
+"""Install / remove the MousePods head-tracking DLLs in a Wine prefix (Steam Proton or any other).
 
 The game loads our NPClient / FreeTrackClient DLLs itself (TrackIR / FreeTrack protocols); the
 DLLs read the head pose from a Linux file through Wine's Z: drive. Nothing runs inside the game.
@@ -26,11 +26,13 @@ OUR_PATH = r"C:\\mousepods\\"           # as written in user.reg (escaped backsl
 
 
 class BridgeError(Exception):
-    """code: no_prefix | running | missing_dll | no_backup | switch_off_first"""
+    """code: no_prefix | running | missing_dll | no_backup | switch_off_first
+    (games outside Steam: bad_name | bad_prefix | prefix_hidden | already_added)"""
 
-    def __init__(self, code):
+    def __init__(self, code, path=None):
         super().__init__(code)
         self.code = code
+        self.path = path            # prefix_hidden: the folder to allow in the Flatpak
 
 
 def _reg_escape(path):
@@ -145,6 +147,27 @@ def running_appids(proc="/proc", now=None):
     return {a for a, t in _LAST_SEEN.items() if now - t <= GRACE_S}
 
 
+_PREFIX_SEEN = {}      # real path of a Wine prefix -> monotonic time a process last used it
+
+
+def running_prefixes(proc="/proc", now=None):
+    """Wine prefixes in use now or within GRACE_S: WINEPREFIX in a process environment. Lutris,
+    Heroic, Bottles, the LUG Helper (Star Citizen) and Proton all set it for the game they start."""
+    import time as _time
+    now = _time.monotonic() if now is None else now
+    for d in glob.glob(os.path.join(proc, "[0-9]*")):
+        try:
+            with open(os.path.join(d, "environ"), "rb") as f:
+                for item in f.read().split(b"\0"):
+                    if item.startswith(b"WINEPREFIX=") and len(item) > 11:
+                        path = os.fsdecode(item[11:])
+                        _PREFIX_SEEN[os.path.realpath(path)] = now
+                        break
+        except OSError:
+            continue
+    return {p for p, t in _PREFIX_SEEN.items() if now - t <= GRACE_S}
+
+
 def process_running(appid, proc="/proc"):
     """True if the game runs (or quit less than GRACE_S ago)."""
     return str(appid) in running_appids(proc)
@@ -180,6 +203,44 @@ def install(game, dll_dir, pose_file, is_running=process_running, tables=None):
     if tables:
         text = _set_section(text, KEY_TABLE, trackir_tables.reg_lines(tables))
     _write_reg(reg, text)
+
+
+def _table_values(lines):
+    """{name: value} of registry lines. Wine rewrites user.reg after a session (#time= lines,
+    values sorted as text), so the table is compared as a dict, not line by line."""
+    out = {}
+    for ln in lines:
+        name, sep, value = ln.strip().partition("=")
+        if sep and not ln.lstrip().startswith("#"):
+            out[name] = value.lower()
+    return out
+
+
+def _table_lines(text):
+    span = _sections(text).get(KEY_TABLE.lower())
+    if not span:
+        return None
+    return text[span[0]:span[1]].splitlines()[1:]
+
+
+def refresh_tables(game, is_running=process_running, tables=None):
+    """Bring the TrackIR tables of a game that is already switched on up to date (set up by an older
+    MousePods, or opentrack's list changed), without switching it off and on. Only when our bridge
+    is in the prefix and the game is closed; True if user.reg was changed."""
+    if status(game) != "on" or is_running(game.appid):
+        return False
+    tables = trackir_tables.load() if tables is None else tables
+    if not tables:
+        return False
+    reg = os.path.join(game.prefix, "user.reg")
+    with open(reg, encoding="utf-8", errors="surrogateescape") as f:
+        text = f.read()
+    lines = trackir_tables.reg_lines(tables)
+    current = _table_lines(text)
+    if current is not None and _table_values(current) == _table_values(lines):
+        return False
+    _write_reg(reg, _set_section(text, KEY_TABLE, lines))
+    return True
 
 
 def uninstall(game, is_running=process_running):

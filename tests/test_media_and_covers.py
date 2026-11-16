@@ -101,7 +101,7 @@ class MediaAndCoverHttpTests(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"MOUSEPODS_STEAM_ROOT": self.steam,
                                                 "MOUSEPODS_DLL_DIR": os.path.join(self.home, "dlls")})
         self.env.start()
-        self.run_patch = mock.patch.object(games_service, "is_running", lambda appid: False)
+        self.run_patch = mock.patch.object(games_service, "is_running", lambda appid, cfg_path=None: False)
         self.run_patch.start()
         self.ui = web.WebUI(types.SimpleNamespace(cfg={"ui_lang": "en", "games": {}}), self.cfg_path, port=0)
         self.ui.q = queue.Queue()

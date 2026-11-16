@@ -120,7 +120,7 @@ Linux avec BlueZ, AirPods appairés, accès en écriture à `/dev/uinput` (accor
 |---|---|---|---|
 | Assetto Corsa | Proton, page Jeux ou OpenTrack | AirPods Pro 2 | @henningnorden |
 | Euro Truck Simulator 2 | Proton Experimental, page Jeux | AirPods Pro 2 | @henningnorden |
-| Star Citizen | Wine (RSI Launcher), pont installé à la main, table TrackIR « Enhanced » | AirPods Pro 3 | @f3nr1l |
+| Star Citizen | Wine (RSI Launcher, LUG Helper), pont installé à la main, table TrackIR « Enhanced » | AirPods Pro 3 | @f3nr1l |
 
 Testé dans un autre jeu ? [Raconte-nous](https://github.com/starman-tech/mousepods/issues/new?template=game_report.yml), il ira dans ce tableau.
 

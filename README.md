@@ -55,7 +55,8 @@ Contributed by [@henningnorden](https://github.com/henningnorden) for sim racing
 - **Games page:** tick a Steam game running through Proton and its camera follows your head,
   without opentrack and without launch options. MousePods places a small TrackIR/FreeTrack DLL
   (`native/`) in the game's Proton prefix; the game reads the head pose from a file MousePods
-  writes. Unticking puts back whatever tracker was set up before.
+  writes. Unticking puts back whatever tracker was set up before. A game outside Steam (Lutris,
+  Heroic, Bottles, LUG Helper, plain Wine) is added by its name and Wine prefix folder.
 - **Per-game profiles:** damping, range and response curve per axis, axes on/off, and a neck
   model (computed from the head rotation, AirPods cannot measure leaning). **Calibrate** shows
   one point at a time full screen on the monitors you play that game on; hold still at each and
@@ -205,7 +206,7 @@ with *Enable both*. Assetto Corsa follows the head in the cockpit camera.
 |---|---|---|---|
 | Assetto Corsa | Proton, Games page or opentrack | AirPods Pro 2 | @henningnorden |
 | Euro Truck Simulator 2 | Proton Experimental, Games page | AirPods Pro 2 | @henningnorden |
-| Star Citizen | Wine (RSI Launcher), bridge set up by hand, TrackIR "Enhanced" table | AirPods Pro 3 | @f3nr1l |
+| Star Citizen | Wine (RSI Launcher, LUG Helper), bridge set up by hand, TrackIR "Enhanced" table | AirPods Pro 3 | @f3nr1l |
 
 Tried it in another game? [Tell us](https://github.com/starman-tech/mousepods/issues/new?template=game_report.yml), it goes in this table.
 

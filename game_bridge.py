@@ -22,7 +22,7 @@ VERSION = 1
 MAX_DT = 0.1          # a gap (reconnect, suspend) must not throw the smoothing filter
 
 
-_APPID = re.compile(r"^[0-9]+$")
+_APPID = re.compile(r"^(?:[0-9]+|wine-[a-z0-9]+(?:-[0-9]+)?)$")   # Steam appid, or a game outside Steam
 
 
 FLATPAK_STEAM = "com.valvesoftware.Steam"
@@ -56,7 +56,7 @@ def private_dir(shm_dir="/dev/shm", flatpak=False):
 def pose_path(appid, shm_dir="/dev/shm", flatpak=False):
     appid = str(appid)
     if not _APPID.match(appid):
-        raise ValueError(f"invalid Steam appid {appid!r}")
+        raise ValueError(f"invalid game id {appid!r}")
     return os.path.join(_pose_dir(shm_dir, flatpak), f"pose-{appid}")
 
 

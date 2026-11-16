@@ -880,7 +880,7 @@ a.lrow:hover,button.lrow:hover{background:var(--line)}
 </section>
 
 <section class="page" id="p-games">
-  <h1 data-i18n="games.title">Games</h1><div class="sub" data-i18n="games.intro">Tick a Steam game and its in-game camera follows your head, without opentrack. The game must be closed while you switch it on or off.</div>
+  <h1 data-i18n="games.title">Games</h1><div class="sub" data-i18n="games.intro">Tick a game and its in-game camera follows your head, without opentrack: Steam games are found by themselves, other games (Lutris, Heroic, LUG Helper, plain Wine) are added by their Wine prefix. The game must be closed while you switch it on or off.</div>
   <div class="card" style="margin-bottom:14px"><h3 data-i18n="games.live">Live head pose</h3><div class="vec" id="games-live"></div>
     <div class="hint" data-i18n="games.live_hint">Open a game's profile to see what that game receives.</div></div>
   <div id="games-list"><div class="card empty" data-i18n="games.loading">Looking for Steam games…</div></div>
@@ -1424,7 +1424,7 @@ function curveToSens(c){return Math.min(Math.max((3-c)/2,0),1)}
 let gamesData=null,gamesTimer=null;
 const GAXES=["yaw","pitch","roll"];
 function axisLabel(n){return n==="yaw"?t("js.games.axis_yaw"):n==="pitch"?t("js.games.axis_pitch"):t("js.games.axis_roll")}
-function gameHint(g){if(!g.has_prefix)return t("js.games.hint_no_prefix");
+function gameHint(g){if(!g.has_prefix)return g.wine?t("js.games.hint_wine_no_prefix",{path:g.prefix}):t("js.games.hint_no_prefix");
   if(g.running)return t("js.games.hint_running");if(g.status==="foreign"&&!g.enabled)return t("js.games.hint_foreign",{name:g.foreign_tracker&&g.foreign_tracker!=="?"?g.foreign_tracker:t("js.games.other_tracker")});return ""}
 function gameCard(g){const p=g.profile,dis=!g.has_prefix||g.running;
   const pill=g.status==="on"?`<span class="pill g">${t("js.games.on")}</span>`:g.status==="foreign"?`<span class="pill o">${esc(g.foreign_tracker&&g.foreign_tracker!=="?"?g.foreign_tracker:t("js.games.foreign"))}</span>`:`<span class="pill">${t("js.games.off")}</span>`;
@@ -1436,7 +1436,7 @@ function gameCard(g){const p=g.profile,dis=!g.has_prefix||g.running;
     ${e?rng("edge_neg",2,180,1,a.edge_neg,t(e[0]))+rng("edge_pos",2,180,1,a.edge_pos,t(e[1])):rng("edge_pos",2,180,1,a.edge_pos,t("js.games.edge_both"))}
     ${rng("target",0,180,5,a.target,t("js.games.target"))}
     ${rng("sens",0,1,0.05,curveToSens(a.curve),t("js.games.sensitivity"))}</div>`}).join("");
-  return `<div class="card game" data-appid="${esc(g.appid)}"><div class="row"><span class="name">${esc(g.name)}</span>${g.flatpak?`<span class="pill" title="${esc(t("js.games.flatpak_title"))}">Flatpak</span>`:""}${pill}
+  return `<div class="card game" data-appid="${esc(g.appid)}"><div class="row"><span class="name">${esc(g.name)}</span>${g.flatpak?`<span class="pill" title="${esc(t("js.games.flatpak_title"))}">Flatpak</span>`:""}${g.wine?`<span class="pill" title="${esc(g.prefix)}">${esc(t("js.games.wine_pill"))}</span>`:""}${pill}
     <label class="sw"><input type="checkbox" data-toggle ${g.enabled?"checked":""} ${dis?"disabled":""}><span></span></label></div>
     ${g.both?`<div class="kv"><span>${t("js.games.steam_choice")}</span><span><div class="seg" data-steam>
       <button data-v="native" class="${g.flatpak?"":"on"}" ${g.enabled?"disabled":""}>${t("js.games.steam_native")}</button>
@@ -1444,6 +1444,7 @@ function gameCard(g){const p=g.profile,dis=!g.has_prefix||g.running;
       ${g.enabled?`<div class="hint">${t("js.games.steam_switch_off")}</div>`:""}`:""}
     ${gameHint(g)?`<div class="hint">${esc(gameHint(g))}</div>`:""}
     ${g.launch_option_hint?`<div class="hint">${esc(t("js.games.hint_launch_option"))}</div>`:""}
+    ${g.wine?`<div class="kv"><span class="hint mono">${esc(g.prefix)}</span><span><button class="btn sm" data-wine-remove ${g.enabled&&g.has_prefix?"disabled":""}>${t("js.games.wine_remove")}</button></span></div>`:""}
     <details><summary>${t("js.games.profile")}${g.proton?" · "+esc(g.proton.split("/").pop()):""}</summary>
       <div class="row" style="margin:8px 0"><button class="btn sm p" data-calibrate>${t("js.games.calibrate")}</button>
         <span class="hint">${t("js.games.calibrate_hint")}</span></div>
@@ -1464,17 +1465,31 @@ function readProfile(card,prev){const v=f=>card.querySelector(`[data-f="${f}"]`)
     const pos=num(q("edge_pos")),neg=r.querySelector('[data-f="edge_neg"]')?num(q("edge_neg")):pos;
     axes[n]={enabled:q("enabled").checked,invert:q("invert").checked,edge_neg:neg,edge_pos:pos,target:num(q("target")),curve:sensToCurve(num(q("sens")))}});
   return {smoothing:num(v("smoothing")),neck:{enabled:v("neck.enabled").checked,strength:num(v("neck.strength")),lean_forward:v("neck.lean_forward").checked},axes,monitors:(prev&&prev.monitors)||[],own:true}}
-function gameError(r){return r.json().then(j=>{throw new Error(j.error||r.status)})}
+function gameError(r){return r.json().then(j=>{const e=new Error(j.error||r.status);e.code=j.code;e.path=j.path;throw e})}
 function postGame(appid,body){return fetch("/api/games/"+encodeURIComponent(appid),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
   .then(r=>r.ok?r.json():gameError(r))}
+// a game outside Steam: a name and its Wine prefix (Lutris, Heroic, Bottles, LUG Helper, plain Wine)
+function wineForm(){return `<div class="card" data-wine-form><b>${t("js.games.wine_title")}</b><div class="hint">${t("js.games.wine_hint")}</div>
+  <div class="row" style="gap:10px;flex-wrap:wrap;margin-top:8px"><label>${t("js.games.wine_name")} <input type="text" data-wine-name maxlength="80"></label>
+  <label>${t("js.games.wine_prefix")} <input type="text" data-wine-path size="34" placeholder="~/Games/star-citizen"></label>
+  <button class="btn sm p" data-wine-add>${t("js.games.wine_add")}</button></div><div data-wine-msg></div></div>`}
+function wireWineForm(box){const f=box.querySelector("[data-wine-form]");if(!f)return;
+  f.querySelector("[data-wine-add]").onclick=()=>{const name=f.querySelector("[data-wine-name]").value,prefix=f.querySelector("[data-wine-path]").value;
+    const msg=f.querySelector("[data-wine-msg]");msg.innerHTML="";
+    postGame("wine",{name,prefix}).then(r=>{toast(t("js.games.toast_wine_added",{name:r.game.name}));loadGames()}).catch(err=>{
+      if(err.code!=="prefix_hidden"||!err.path)return toast(err.message);
+      msg.innerHTML=`<div class="hint" style="margin-top:8px">${esc(t("js.games.hint_prefix_hidden"))}<br><code>flatpak override --user --filesystem=${esc(err.path)} io.github.starman_tech.MousePods</code></div>`})}}
 function renderGames(){const box=$("#games-list");if(!gamesData)return;
-  if(!gamesData.steam_found){box.innerHTML=`<div class="card empty">${esc(t("js.games.no_steam"))}</div>`;return}
-  if(!gamesData.games.length){box.innerHTML=`<div class="card empty">${esc(t("js.games.no_games"))}</div>`;return}
+  const steamGames=gamesData.games.filter(g=>!g.wine);
+  const empty=!gamesData.steam_found?`<div class="card empty">${esc(t("js.games.no_steam"))}</div>`:!steamGames.length?`<div class="card empty">${esc(t("js.games.no_games"))}</div>`:"";
   const miss=(gamesData.missing_libraries||[]).map(p=>`<div class="card hint">${esc(t("js.games.hint_missing_library",{path:p}))}<br><code>flatpak override --user --filesystem=${esc(p)} io.github.starman_tech.MousePods</code></div>`).join("");
-  box.innerHTML=(gamesData.steam_flatpak?`<div class="card hint">${esc(t("js.games.hint_flatpak"))}</div>`:"")+miss+gamesData.games.map(gameCard).join("");
+  box.innerHTML=(gamesData.steam_flatpak?`<div class="card hint">${esc(t("js.games.hint_flatpak"))}</div>`:"")+miss+empty+gamesData.games.map(gameCard).join("")+wineForm();
+  wireWineForm(box);
   box.querySelectorAll(".game").forEach(card=>{const appid=card.dataset.appid,g=gamesData.games.find(x=>x.appid===appid);
     card.querySelector("[data-toggle]").onchange=e=>{const on=e.target.checked;e.target.disabled=true;
-      postGame(appid,{enabled:on}).then(()=>{toast(on?t("js.games.toast_on",{name:g.name}):t("js.games.toast_off",{name:g.name}));loadGames()})
+      const send=body=>postGame(appid,body).then(()=>{toast(on?t("js.games.toast_on",{name:g.name}):t("js.games.toast_off",{name:g.name}));loadGames()});
+      // Flatpak: a game outside Steam cannot be seen running, the user confirms it is closed
+      send({enabled:on}).catch(err=>{if(err.code==="confirm_closed"&&confirm(t("js.games.confirm_closed",{name:g.name})))return send({enabled:on,closed_confirmed:true});throw err})
         .catch(err=>{toast(err.message);loadGames()})};
     card.querySelectorAll('details input[type=range]').forEach(inp=>{const o=document.createElement("output");o.className="prev";
       const show=()=>o.textContent=" "+(+inp.value).toFixed(inp.step<1?(inp.step<0.1?2:1):0);show();inp.after(o);inp.addEventListener("input",show)});
@@ -1482,6 +1497,8 @@ function renderGames(){const box=$("#games-list");if(!gamesData)return;
       postGame(appid,{profile:prof}).then(()=>toast(t("js.games.toast_profile"))).catch(err=>toast(err.message))});
     card.querySelector("[data-reset]").onclick=()=>postGame(appid,{profile:{}}).then(()=>{toast(t("js.games.toast_reset"));loadGames()});
     card.querySelector("[data-calibrate]").onclick=()=>calibStart(card,g);
+    const rm=card.querySelector("[data-wine-remove]");
+    if(rm)rm.onclick=()=>postGame(appid,{remove:true}).then(()=>{toast(t("js.games.toast_wine_removed",{name:g.name}));loadGames()}).catch(err=>toast(err.message));
     card.querySelectorAll("[data-steam] button").forEach(b=>b.onclick=()=>postGame(appid,{steam:b.dataset.v})
       .then(()=>loadGames()).catch(err=>toast(err.message)));
     const tb=card.querySelector("[data-to-baseline]");

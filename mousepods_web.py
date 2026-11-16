@@ -1114,6 +1114,8 @@ class WebUI:
                         return self._json({"error": tr("srv.error.autostart", error=e)}, 500)
                     m.update_config_file(ui.cfg_path, {"autostart": on})
                     return self._json({"ok": True, "enabled": on})
+                elif self.path == "/api/games/wine":            # add a game outside Steam
+                    return self._wine_add(body)
                 elif self.path.startswith("/api/games/"):
                     return self._games_post(self.path[len("/api/games/"):], body)
                 elif self.path == "/api/version":               # "what's new" read
@@ -1141,12 +1143,25 @@ class WebUI:
                     return self._json({"error": tr("srv.error.not_found")}, 404)
                 self._json({"ok": True})
 
+            def _wine_add(self, body):
+                import bridge_install
+                import games_service
+                try:
+                    gid, entry = games_service.add_wine(ui.cfg_path, body.get("name"), body.get("prefix"))
+                except bridge_install.BridgeError as e:
+                    return self._json({"error": tr("games.error." + e.code), "code": e.code, "path": e.path}, 409)
+                m.update_config_file(ui.cfg_path, {"wine_games": {gid: entry}})
+                return self._json({"ok": True, "appid": gid, "game": entry})
+
             def _games_post(self, appid, body):
                 import bridge_install
                 import games_service
                 game = games_service.find(appid, ui.cfg_path)
                 if game is None:
                     return self._json({"error": tr("srv.error.not_found")}, 404)
+                if ("enabled" in body and games_service.needs_closed_confirmation(game.appid)
+                        and body.get("closed_confirmed") is not True):
+                    return self._json({"error": tr("games.error.confirm_closed"), "code": "confirm_closed"}, 409)
                 try:
                     if "enabled" in body:
                         entry = games_service.set_enabled(ui.cfg_path, game, bool(body["enabled"]))
@@ -1154,6 +1169,11 @@ class WebUI:
                         entry = games_service.set_profile(ui.cfg_path, game, body["profile"])
                     elif body.get("steam") in ("native", "flatpak"):      # game in both Steams
                         entry = games_service.set_steam(ui.cfg_path, game, body["steam"] == "flatpak")
+                    elif body.get("remove") is True and games_service.WINE_ID.match(game.appid):
+                        games_service.remove_wine(ui.cfg_path, game)
+                        m.update_config_file(ui.cfg_path, {"wine_games": {game.appid: None},
+                                                           "games": {game.appid: None}})
+                        return self._json({"ok": True})
                     else:
                         return self._json({"error": tr("srv.error.bad_request")}, 400)
                 except bridge_install.BridgeError as e:
@@ -1168,6 +1188,16 @@ class WebUI:
         self.server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self._refresh_tables, daemon=True).start()
+
+    def _refresh_tables(self):
+        """Games switched on by an older MousePods get their TrackIR tables without an off / on."""
+        try:
+            import games_service
+            for name in games_service.refresh_tables(self.cfg_path):
+                m.log.info("TrackIR tables written for %s", name)
+        except Exception as e:  # noqa: BLE001  (never keep the window from starting)
+            m.log.warning("TrackIR tables not refreshed: %s", e)
 
     def stop(self):
         if self.garmin:
