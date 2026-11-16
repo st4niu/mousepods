@@ -5,24 +5,20 @@ A virtual 7.1 output, "MousePods Spatial", is added to PipeWire. Audio sent to i
 binaurally with an HRTF onto the AirPods (or any stereo sink), and the virtual speakers stay fixed
 in the room while the head turns.
 
-How it works:
-  * HRIRs: libmysofa (through ctypes) reads a SOFA file and gives the left/right impulse responses
-    for 60 fixed directions (3 rings: elevation -30° x 12, 0° x 36, +30° x 12). A diffuse-field
-    equaliser (the inverse of the average spectrum of all directions, 1/3-octave smoothed, ±12 dB,
-    minimum phase) removes the coloration common to every direction. Each direction is written as
-    a stereo WAV (32-bit PCM) into a cache, rebuilt only when the SOFA file, the sample rate or the
-    direction set change.
-  * Graph: a PipeWire filter-chain (run as its own `pipewire -c filter-chain.conf` process, with a
-    private XDG_CONFIG_HOME so only our fragment is loaded). The 8 input channels go through `copy`
-    nodes into 60 `mixer` nodes, one per direction; each direction mixer feeds two `convolver` nodes
-    (left ear, right ear); two mixer trees sum the 60 left and the 60 right ears.
-  * Head tracking: the gains of the 60 direction mixers ("m<d>:Gain <k>" = how much of input
-    channel k goes to direction d) are the panning. Each virtual speaker is panned between its
-    nearest directions (pairwise, energy preserving), at its position relative to the head. A
-    long-lived `pw-cli` receives `set-param` lines with the gains that changed, at most 100 Hz.
-    The builtin mixer has no gain ramp, so the pose is low-passed (50 ms) and every gain moves by
-    at most MAX_STEP per update: each step stays tiny and inaudible. The HRIR convolutions never
-    change, so there is no reload.
+How it works (three helper processes, all PipeWire command-line tools, plus one render thread):
+  * the sink: a long-lived `pw-cli` creates a null audio sink (8 channels) owned by its client
+    (object.linger = false), so the sink disappears with that pw-cli, even if MousePods crashes;
+  * capture: `pw-record` reads the sink's monitor (stream.capture.sink) as f32 frames on its
+    stdout (PipeWire 1.2.4 writes them raw; a WAV or .au header is parsed if a version adds one);
+  * render: spatial_render.Renderer, block by block (512 frames): HRIR of the exact direction of
+    every virtual speaker relative to the head (libmysofa interpolates), old/new HRIR crossfade
+    inside each block (no click when the head moves), diffuse-field EQ, dry/binaural mix;
+  * playback: `pw-play` reads the binaural stereo from its stdin (raw f32) and plays it on
+    the chosen output (AirPods) with node.dont-reconnect, so it never falls back onto our own sink.
+The capture side runs on the null sink's clock, the playback side on the output's clock (both
+follow the system clock). The pipes are kept short (~2 blocks queued) and trimmed by whole
+blocks if they grow. Do NOT put the streams in one node.group: pw-play's blocking read would then
+stall every graph cycle (measured: half the cycles skipped, garbled audio).
 
 Conventions:
   * azimuth in degrees, positive = to the LEFT (counter-clockwise seen from above), 0 = front;
@@ -32,14 +28,14 @@ Conventions:
     opentrack_out.py). Roll is ignored for now: tilting the head sideways does not move the
     speakers (a small error, much less audible than yaw).
 
-Only the stdlib and numpy. PipeWire needs the builtin filter-chain plugins `convolver`, `mixer`
-and `copy` (PipeWire >= 0.3.x; the `sofa` plugin is not needed).
+Only the stdlib and numpy, libmysofa through ctypes, and pw-cli / pw-record / pw-play / pw-dump.
 """
 from __future__ import annotations
 
 import atexit
 import ctypes
 import ctypes.util
+import fcntl
 import glob
 import hashlib
 import json
@@ -48,203 +44,61 @@ import math
 import os
 import shutil
 import signal
+import struct
 import subprocess
+import termios
 import threading
 import time
-import wave
 import weakref
 
 import numpy as np
 
+import spatial_render as sr
+from spatial_render import relative_direction, smooth_pose, speakers  # noqa: F401  (public helpers)
+
 log = logging.getLogger(__name__)
 
-RATE = 48000
-OWN_SINK = "mousepods_spatial"                  # node.name of our virtual sink (capture side)
-OWN_OUTPUT = "mousepods_spatial.output"        # node.name of our playback stream
+RATE = sr.RATE
+BLOCK = sr.BLOCK
+CHANNELS = sr.CHANNELS
+OWN_SINK = "mousepods_spatial"                  # node.name of our virtual sink
+OWN_OUTPUT = OWN_SINK + ".output"               # node.name of our playback stream
 DESCRIPTION = "MousePods Spatial"
-CHANNELS = ("FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR")
-# rings of fixed HRIR directions: (elevation in degrees, number of azimuths, evenly spaced from 0)
-# The horizontal ring is dense (every 10°) so that neighbouring HRIRs have close interaural delays
-# (panning between two HRIRs whose delays differ a lot gives comb filtering), and so that FC and
-# FL/FR at ±30° sit exactly on a direction when the head is at rest.
-RINGS = ((-30.0, 12), (0.0, 36), (30.0, 12))
-EL_MIN, EL_MAX = RINGS[0][0], RINGS[-1][0]
 SOFA_RADIUS = 1.2                               # m, distance asked to libmysofa
-UPDATE_HZ = 100.0                               # most set-param lines per second
-SMOOTH_S = 0.05                                 # time constant of the pose low-pass (s)
-MAX_STEP = 0.04                                 # largest change of one gain per update
-THRESHOLD = 0.002                               # smallest gain change worth sending
-HEALTH_S = 5.0                                  # how often the worker checks the graph is still there
-CACHE_VERSION = 2                               # bump when the HRIR processing changes
-MAX_IR = 512                                    # HRIR length kept (samples, faded out at the end)
-MAX_LINE = 3800                                 # pw-cli reads its input in 4 KiB chunks
+HEALTH_S = 2.0                                  # how often the health thread looks at the graph
+RESPAWN_S = 1.0                                 # at most one restart of a stream per second
+MAX_PIPE_BLOCKS = 4                             # trim a pipe that holds more blocks than this
+PREFILL_BLOCKS = 2                              # silence written ahead to pw-play at start
+CACHE_VERSION = 3                               # bump when the EQ computation changes
+F_SETPIPE_SZ = 1031                             # fcntl (linux/fcntl.h)
 
 DEFAULTS = {
     "width": 30.0,          # azimuth of the front left/right speakers (degrees)
+    "intensity": 0.75,      # 1 = fully binaural, 0 = plain stereo downmix
     "make_default": True,   # make "MousePods Spatial" the default output while it runs
-    "gain_db": -3.0,        # overall level; -3 dB of headroom (the near ear gets up to +4 dB)
-    "blocksize": 256,       # convolver partition size (samples): larger = less CPU, same latency
+    "gain_db": 0.0,         # overall level (a limiter keeps it under full scale)
     "output": None,         # node.name of the sink to render onto; None = AirPods, else default
     "hrtf": None,           # path of a .sofa file; None = the first one found (see find_hrtf)
+    "sink_name": OWN_SINK,  # node.name of the virtual sink (only tests change it)
 }
 
 
-# ------------------------------------------------------------------ directions and panning
+# ------------------------------------------------------------------ directions for the EQ
 def directions():
-    """The 60 fixed directions as (azimuth, elevation) in degrees, ring by ring (low, middle,
-    high), azimuths in (-180, 180]."""
+    """Grid used to measure the diffuse field: rings at -30° (12), 0° (36) and +30° (12)."""
     out = []
-    for el, n in RINGS:
-        step = 360.0 / n
+    for el, n in ((-30.0, 12), (0.0, 36), (30.0, 12)):
         for i in range(n):
-            az = i * step
+            az = i * 360.0 / n
             out.append((az - 360.0 if az > 180.0 else az, el))
     return out
 
 
 DIRECTIONS = directions()
-_RING_START = []                                # index of the first direction of each ring
-_i = 0
-for _el, _n in RINGS:
-    _RING_START.append(_i)
-    _i += _n
-N_DIRS = _i
+N_DIRS = len(DIRECTIONS)
 
 
-def _ring_gains(az, n):
-    """Pairwise amplitude panning on a ring of n evenly spaced directions: list of (index in the
-    ring, gain), sin/cos law on the angular fraction between the two neighbours."""
-    step = 360.0 / n
-    pos = (az % 360.0) / step
-    i = int(math.floor(pos)) % n
-    f = pos - math.floor(pos)
-    j = (i + 1) % n
-    return [(i, math.cos(f * math.pi / 2)), (j, math.sin(f * math.pi / 2))]
-
-
-def gains_for(az, el):
-    """Gains of the 60 directions for one source seen at (az, el), energy preserving (the sum of
-    the squares is 1). Elevation is clamped to the rings [-30, 30]; between two rings the source
-    is shared with cos/sin weights."""
-    el = min(max(float(el), EL_MIN), EL_MAX)
-    g = [0.0] * N_DIRS
-    # the two rings around el
-    for r in range(len(RINGS) - 1):
-        lo, hi = RINGS[r][0], RINGS[r + 1][0]
-        if el <= hi or r == len(RINGS) - 2:
-            t = (el - lo) / (hi - lo)
-            t = min(max(t, 0.0), 1.0)
-            weights = ((r, math.cos(t * math.pi / 2)), (r + 1, math.sin(t * math.pi / 2)))
-            break
-    for ring, w in weights:
-        if w < 1e-9:
-            continue
-        start, n = _RING_START[ring], RINGS[ring][1]
-        for k, gk in _ring_gains(az, n):
-            g[start + k] += w * gk
-    return g
-
-
-def speakers(width=30.0):
-    """Virtual speaker layout: {channel: (azimuth, elevation, gain)}. `width` is the azimuth of
-    FL/FR (the other speakers do not move)."""
-    w = float(width)
-    return {
-        "FL": (w, 0.0, 1.0), "FR": (-w, 0.0, 1.0), "FC": (0.0, 0.0, 1.0),
-        "LFE": (0.0, -30.0, 0.5),
-        "RL": (150.0, 0.0, 1.0), "RR": (-150.0, 0.0, 1.0),
-        "SL": (90.0, 0.0, 1.0), "SR": (-90.0, 0.0, 1.0),
-    }
-
-
-def relative_direction(src_az, src_el, yaw, pitch):
-    """Where a room-fixed source at (src_az, src_el) is heard when the head has turned by
-    (yaw, pitch). For yaw alone this is exactly (src_az + yaw, src_el); for a source in front,
-    looking up by p puts it at elevation -p. A real rotation (yaw then pitch) is used so that a
-    source behind or beside the head also moves the right way when looking up or down."""
-    a, e = math.radians(src_az), math.radians(src_el)
-    v = (math.cos(e) * math.cos(a), math.cos(e) * math.sin(a), math.sin(e))   # x front, y left, z up
-    # head orientation = Rz(-yaw) . Ry(-pitch); the source in head coordinates is its transpose
-    # applied to v: first undo the yaw (rotate by +yaw about z) ...
-    cy, sy = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
-    x, y, z = cy * v[0] - sy * v[1], sy * v[0] + cy * v[1], v[2]
-    # ... then undo the pitch (rotate by +pitch about y, the left axis: front goes down)
-    cp, sp = math.cos(math.radians(pitch)), math.sin(math.radians(pitch))
-    x, z = cp * x + sp * z, -sp * x + cp * z
-    az = math.degrees(math.atan2(y, x))
-    el = math.degrees(math.asin(max(-1.0, min(1.0, z))))
-    return az, el
-
-
-def gain_matrix(yaw=0.0, pitch=0.0, width=30.0):
-    """8 x N_DIRS numpy array: gain of input channel k (CHANNELS order) into direction d."""
-    spk = speakers(width)
-    m = np.zeros((len(CHANNELS), N_DIRS))
-    for k, ch in enumerate(CHANNELS):
-        az, el, g = spk[ch]
-        raz, rel = relative_direction(az, el, yaw, pitch)
-        m[k] = np.asarray(gains_for(raz, rel)) * g
-    return m
-
-
-def control_name(d, k):
-    """Filter-chain control for "input channel k (0-based) into direction d"."""
-    return f"m{d}:Gain {k + 1}"
-
-
-def limit_step(last, new, max_step=MAX_STEP):
-    """Move every gain from `last` towards `new` by at most `max_step`: the builtin mixer has no
-    ramp, so a large gain jump in one quantum would click."""
-    last = np.asarray(last)
-    return last + np.clip(np.asarray(new) - last, -max_step, max_step)
-
-
-def smooth_pose(cur, target, dt, tau=SMOOTH_S):
-    """One step of a one-pole low-pass on (yaw, pitch); yaw takes the short way round."""
-    if cur is None:
-        return tuple(target)
-    a = 1.0 - math.exp(-dt / tau) if tau > 0 else 1.0
-    dy = (target[0] - cur[0] + 180.0) % 360.0 - 180.0
-    dp = target[1] - cur[1]
-    if abs(dy) < 0.02 and abs(dp) < 0.02:
-        return tuple(target)
-    return (cur[0] + a * dy, cur[1] + a * dp)
-
-
-def diff_updates(last, new, threshold=THRESHOLD):
-    """Which gains to send. `last` and `new` are 8 x N_DIRS arrays (last = what PipeWire has now).
-    A gain is sent when it moved by more than `threshold`; a gain that fell below the threshold
-    while PipeWire still has something else is sent as an exact 0 (no stale leftovers).
-    Returns a list of (d, k, value)."""
-    last = np.asarray(last)
-    new = np.where(np.asarray(new) < threshold, 0.0, np.asarray(new))
-    changed = (np.abs(new - last) > threshold) | ((new == 0.0) & (last != 0.0))
-    out = []
-    for k, d in zip(*np.nonzero(changed)):
-        out.append((int(d), int(k), float(new[k, d])))
-    return out
-
-
-def set_param_lines(node_id, updates, max_len=MAX_LINE):
-    """pw-cli lines for a list of (d, k, value); normally one line, split only if it would be
-    longer than pw-cli's input buffer."""
-    head = f"set-param {node_id} Props {{ params = [ "
-    tail = " ] }"
-    lines, cur = [], []
-    size = len(head) + len(tail)
-    for d, k, v in updates:
-        item = f'"{control_name(d, k)}" {v:.4f}'
-        if cur and size + len(item) + 1 > max_len:
-            lines.append(head + " ".join(cur) + tail)
-            cur, size = [], len(head) + len(tail)
-        cur.append(item)
-        size += len(item) + 1
-    if cur:
-        lines.append(head + " ".join(cur) + tail)
-    return lines
-
-
-# ------------------------------------------------------------------ HRIRs (libmysofa) and WAV files
+# ------------------------------------------------------------------ HRIRs (libmysofa)
 class Mysofa:
     """Thin ctypes binding of libmysofa's "easy" API (only what we need)."""
 
@@ -314,17 +168,37 @@ def extract_hrirs(sofa_path, dirs=DIRECTIONS, rate=RATE, mysofa=None):
     return out
 
 
-def normalise(irs, peak=0.98):
-    """One global factor for all IRs so the loudest sample is `peak` (32-bit PCM cannot go past
-    full scale). Returns (scaled IRs, factor); the convolver gain must be 1 / factor to keep the
-    original level."""
-    m = float(np.max(np.abs(irs))) if np.size(irs) else 0.0
-    if m <= 0:
-        raise ValueError("the HRIRs are silent")
-    k = peak / m
-    return irs * k, k
 
 
+class SofaHrtf:
+    """HRIR source for the renderer: fetch(az, el) -> (2, n) with the ear delays prepended.
+    Only used from one thread at a time (libmysofa's lookup is not thread-safe)."""
+
+    def __init__(self, path, rate=RATE, mysofa=None):
+        self.mysofa = mysofa or Mysofa()
+        self.h, self.n = self.mysofa.open(path, rate)
+        self.rate = rate
+
+    def __call__(self, az, el):
+        a, e = math.radians(az), math.radians(el)
+        left, right, dl, dr = self.mysofa.getfilter(
+            self.h, self.n, SOFA_RADIUS * math.cos(e) * math.cos(a),
+            SOFA_RADIUS * math.cos(e) * math.sin(a), SOFA_RADIUS * math.sin(e))
+        pl = max(0, int(round(float(dl) * self.rate)))
+        pr = max(0, int(round(float(dr) * self.rate)))
+        n = max(pl + len(left), pr + len(right))
+        out = np.zeros((2, n))
+        out[0, pl:pl + len(left)] = left
+        out[1, pr:pr + len(right)] = right
+        return out
+
+    def close(self):
+        if self.h:
+            self.mysofa.close(self.h)
+            self.h = None
+
+
+# ------------------------------------------------------------------ diffuse-field EQ
 def _third_octave_smooth(f, p):
     """Average a power spectrum over a 1/3 octave around every frequency."""
     cs = np.concatenate([[0.0], np.cumsum(p)])
@@ -343,14 +217,6 @@ def _minimum_phase(mag, nfft):
     w[1:nfft // 2] = 2.0
     w[nfft // 2] = 1.0
     return np.fft.irfft(np.exp(np.fft.rfft(c * w)), nfft)
-
-
-def pink_energy(irs, rate=RATE, nfft=4096):
-    """Loudness proxy: energy of all IRs weighted by a pink spectrum (1/f), 20 Hz - 20 kHz."""
-    f = np.fft.rfftfreq(nfft, 1.0 / rate)
-    band = (f >= 20.0) & (f <= 20000.0)
-    p = np.abs(np.fft.rfft(irs, nfft, axis=-1)) ** 2
-    return float(np.sum(p[..., band] / f[band]))
 
 
 def diffuse_field_filter(irs, rate=RATE, nfft=4096, taps=256, limit_db=12.0, band=(150.0, 16000.0)):
@@ -376,86 +242,37 @@ def diffuse_field_filter(irs, rate=RATE, nfft=4096, taps=256, limit_db=12.0, ban
     return h
 
 
-def equalise(irs, rate=RATE, max_len=MAX_IR):
-    """Apply the diffuse-field equaliser to every HRIR, keep `max_len` samples (half-Hann fade
-    on the last 64) and keep the pink-weighted loudness of the set unchanged."""
-    h = diffuse_field_filter(irs, rate)
-    out = np.apply_along_axis(lambda x: np.convolve(x, h), -1, irs)
-    if max_len and out.shape[-1] > max_len:
-        out = out[..., :max_len].copy()
-        fade = min(64, max_len // 4)
-        out[..., -fade:] *= 0.5 * (1 + np.cos(np.linspace(0, np.pi, fade)))
-    before, after = pink_energy(irs, rate), pink_energy(out, rate)
-    if after > 0:
-        out *= math.sqrt(before / after)
-    return out
 
 
-def write_wav(path, stereo, rate=RATE):
-    """Write a (2, n) float array in [-1, 1] as a stereo 32-bit PCM WAV (stdlib wave)."""
-    data = np.clip(np.asarray(stereo, dtype=np.float64).T, -1.0, 1.0)
-    ints = np.round(data * 2147483647.0).astype("<i4")
-    tmp = path + ".tmp"
-    with wave.open(tmp, "wb") as w:
-        w.setnchannels(2)
-        w.setsampwidth(4)
-        w.setframerate(int(rate))
-        w.writeframes(ints.tobytes())
-    os.replace(tmp, path)
-
-
-def read_wav(path):
-    """Read back a WAV written by write_wav: (array (channels, n) in [-1, 1], rate)."""
-    with wave.open(path, "rb") as w:
-        ch, width, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
-        raw = w.readframes(n)
-    if width != 4:
-        raise ValueError("only 32-bit PCM is supported")
-    ints = np.frombuffer(raw, dtype="<i4").reshape(-1, ch)
-    return (ints.astype(np.float64) / 2147483647.0).T, rate
-
-
-def cache_key(sofa_path, rate=RATE, dirs=DIRECTIONS):
-    """Key of the HRIR cache: SOFA file identity (path, size, mtime) + rate + direction set."""
+def cache_key(sofa_path, rate=RATE):
+    """Key of the EQ cache: SOFA file identity (path, size, mtime) + rate + version."""
     st = os.stat(sofa_path)
     blob = json.dumps({"v": CACHE_VERSION, "sofa": os.path.abspath(sofa_path), "size": st.st_size,
-                       "mtime": st.st_mtime_ns, "rate": int(rate), "max_ir": MAX_IR,
-                       "dirs": [[round(a, 4), round(e, 4)] for a, e in dirs]}, sort_keys=True)
+                       "mtime": st.st_mtime_ns, "rate": int(rate), "dirs": N_DIRS}, sort_keys=True)
     return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
 
-def build_hrir_cache(sofa_path, cache_root, rate=RATE, dirs=DIRECTIONS, mysofa=None, eq=True):
-    """Make (or reuse) the per-direction WAVs. Returns {"files": [...], "factor": k, "length": n}.
-    Old caches (other keys) in cache_root are removed."""
-    key = cache_key(sofa_path, rate, dirs)
-    d = os.path.join(cache_root, key)
-    meta_path = os.path.join(d, "meta.json")
-    files = [os.path.join(d, f"dir{i:02d}.wav") for i in range(len(dirs))]
+def eq_for(sofa_path, cache_dir, rate=RATE, mysofa=None):
+    """Diffuse-field EQ FIR for a SOFA file, computed once and kept in cache_dir (.npy)."""
+    path = os.path.join(cache_dir, f"eq-{cache_key(sofa_path, rate)}.npy")
     try:
-        with open(meta_path) as f:
-            meta = json.load(f)
-        if meta.get("key") == key and all(os.path.exists(p) for p in files):
-            meta["files"] = files
-            return meta
+        h = np.load(path)
+        if h.ndim == 1 and h.size:
+            return h
     except (OSError, ValueError):
         pass
-    irs = extract_hrirs(sofa_path, dirs, rate, mysofa)
-    if eq:
-        irs = equalise(irs, rate)
-    scaled, k = normalise(irs)
-    os.makedirs(d, exist_ok=True)
-    for i, p in enumerate(files):
-        write_wav(p, scaled[i], rate)
-    meta = {"key": key, "factor": k, "length": int(irs.shape[2]), "rate": int(rate),
-            "sofa": os.path.abspath(sofa_path)}
-    with open(meta_path + ".tmp", "w") as f:
-        json.dump(meta, f)
-    os.replace(meta_path + ".tmp", meta_path)
-    for other in glob.glob(os.path.join(cache_root, "*")):          # drop stale caches
-        if os.path.isdir(other) and os.path.basename(other) != key:
-            shutil.rmtree(other, ignore_errors=True)
-    meta["files"] = files
-    return meta
+    irs = extract_hrirs(sofa_path, DIRECTIONS, rate, mysofa)
+    h = diffuse_field_filter(irs, rate)
+    os.makedirs(cache_dir, exist_ok=True)
+    for old in glob.glob(os.path.join(cache_dir, "eq-*.npy")):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    tmp = path + ".tmp.npy"
+    np.save(tmp, h)
+    os.replace(tmp, path)
+    return h
 
 
 def find_hrtf(data_dir=None):
@@ -471,111 +288,6 @@ def find_hrtf(data_dir=None):
         found += sorted(glob.glob(os.path.join(d, "*.sofa")))
     found.sort(key=lambda p: (0 if "kemar" in os.path.basename(p).lower() else 1))
     return found[0] if found else None
-
-
-# ------------------------------------------------------------------ filter-chain configuration
-def _fmt(v):
-    return f"{float(v):.6f}"
-
-
-def build_conf(ir_files, ir_gain, output_sink, initial, blocksize=256, fanout=4):
-    """Text of the filter-chain fragment. `ir_files`: one stereo WAV per direction;
-    `ir_gain`: convolver gain (undoes the normalisation, plus the level); `output_sink`: node.name
-    of the sink to play onto; `initial`: 8 x N_DIRS starting gains."""
-    if not output_sink or output_sink in (OWN_SINK, OWN_OUTPUT):
-        raise ValueError("the spatial output needs a real sink, never itself")
-    if len(ir_files) != N_DIRS:
-        raise ValueError(f"{N_DIRS} HRIR files expected, got {len(ir_files)}")
-    initial = np.asarray(initial)
-    nodes, links = [], []
-    for ch in CHANNELS:
-        nodes.append(f'{{ type = builtin label = copy name = c{ch} }}')
-    for d in range(N_DIRS):
-        ctl = " ".join(f'"Gain {k + 1}" = {_fmt(initial[k, d])}' for k in range(len(CHANNELS)))
-        nodes.append(f'{{ type = builtin label = mixer name = m{d} control = {{ {ctl} }} }}')
-        for ear, side in ((0, "l"), (1, "r")):
-            fn = json.dumps(os.path.abspath(ir_files[d]))
-            nodes.append(f'{{ type = builtin label = convolver name = {side}{d} config = {{ '
-                         f'filename = {fn} channel = {ear} gain = {_fmt(ir_gain)} '
-                         f'blocksize = {int(blocksize)} }} }}')
-    # source channel k -> "In k+1" of every direction mixer, through a tree of copy nodes:
-    # PipeWire 1.2.4's filter-chain corrupts its memory (malloc abort) when outputs fan out to
-    # many inputs (one output to 32 inputs, or 8 outputs to 24 each), so no output feeds more
-    # than `fanout` inputs.
-    for k, ch in enumerate(CHANNELS):
-        targets = [f"m{d}:In {k + 1}" for d in range(N_DIRS)]
-        level = 0
-        while len(targets) > fanout:
-            nxt = []
-            for g in range(0, len(targets), fanout):
-                name = f"t{ch}_{level}_{g // fanout}"
-                nodes.append(f'{{ type = builtin label = copy name = {name} }}')
-                for tgt in targets[g:g + fanout]:
-                    links.append(f'{{ output = "{name}:Out" input = "{tgt}" }}')
-                nxt.append(f"{name}:In")
-            targets, level = nxt, level + 1
-        for tgt in targets:
-            links.append(f'{{ output = "c{ch}:Out" input = "{tgt}" }}')
-    for d in range(N_DIRS):
-        for side in ("l", "r"):
-            links.append(f'{{ output = "m{d}:Out" input = "{side}{d}:In" }}')
-    # sum tree per ear: mixers of (up to) 8 inputs, level after level, down to one "s<l|r>"
-    for side in ("l", "r"):
-        outs = [f"{side}{d}:Out" for d in range(N_DIRS)]
-        level = 0
-        while True:
-            groups = [outs[g:g + 8] for g in range(0, len(outs), 8)]
-            last = len(groups) == 1
-            nxt = []
-            for g, grp in enumerate(groups):
-                name = f"s{side}" if last else f"s{side}{level}_{g}"
-                nodes.append(f'{{ type = builtin label = mixer name = {name} }}')
-                for i, o in enumerate(grp):
-                    links.append(f'{{ output = "{o}" input = "{name}:In {i + 1}" }}')
-                nxt.append(f"{name}:Out")
-            if last:
-                break
-            outs, level = nxt, level + 1
-    inputs = " ".join(f'"c{ch}:In"' for ch in CHANNELS)
-    pos = " ".join(CHANNELS)
-    ind = "                    "
-    return f"""# Generated by MousePods (spatial_audio.py). Do not edit: rewritten at every start.
-context.modules = [
-    {{ name = libpipewire-module-filter-chain
-        args = {{
-            node.description = "{DESCRIPTION}"
-            media.name = "{DESCRIPTION}"
-            filter.graph = {{
-                nodes = [
-{ind}{(chr(10) + ind).join(nodes)}
-                ]
-                links = [
-{ind}{(chr(10) + ind).join(links)}
-                ]
-                inputs = [ {inputs} ]
-                outputs = [ "sl:Out" "sr:Out" ]
-            }}
-            capture.props = {{
-                node.name = "{OWN_SINK}"
-                node.description = "{DESCRIPTION}"
-                media.class = Audio/Sink
-                audio.channels = 8
-                audio.position = [ {pos} ]
-            }}
-            playback.props = {{
-                node.name = "{OWN_OUTPUT}"
-                node.description = "{DESCRIPTION} (output)"
-                node.passive = true
-                audio.channels = 2
-                audio.position = [ FL FR ]
-                target.object = "{output_sink}"
-                node.dont-reconnect = true
-                stream.dont-remix = true
-            }}
-        }}
-    }}
-]
-"""
 
 
 # ------------------------------------------------------------------ PipeWire helpers
@@ -644,8 +356,9 @@ def find_output_sink(prefer_bluez=True, dump=None):
     """node.name of the sink to render onto: a connected Bluetooth (AirPods) sink if any, else
     the current default sink. Never our own sink."""
     dump = pw_dump() if dump is None else dump
-    own = (OWN_SINK, OWN_OUTPUT)
-    names = [n for _, n, _ in sinks(dump) if n and n not in own]
+    def own(n):                         # our sink, its streams, test instances
+        return bool(n) and n.startswith(OWN_SINK)
+    names = [n for _, n, _ in sinks(dump) if n and not own(n)]
     default = default_metadata(dump, "default.audio.sink")
     if not default and shutil.which("pactl"):
         default = _run(["pactl", "get-default-sink"]).strip() or None
@@ -653,37 +366,28 @@ def find_output_sink(prefer_bluez=True, dump=None):
         bt = [n for n in names if n.startswith("bluez_output.")]
         if bt:
             return default if default in bt else bt[0]     # several headsets: the default one
-    if default and default not in own and (not names or default in names):
+    if default and not own(default) and (not names or default in names):
         return default
     return names[0] if names else None
 
 
-def _filter_chain_module():
-    for d in ("/usr/lib/x86_64-linux-gnu/pipewire-0.3", "/usr/lib64/pipewire-0.3", "/usr/lib/pipewire-0.3",
-              "/usr/lib/aarch64-linux-gnu/pipewire-0.3"):
-        p = os.path.join(d, "libpipewire-module-filter-chain.so")
+def _null_sink_plugin():
+    for d in ("/usr/lib/x86_64-linux-gnu/spa-0.2", "/usr/lib64/spa-0.2", "/usr/lib/spa-0.2",
+              "/usr/lib/aarch64-linux-gnu/spa-0.2"):
+        p = os.path.join(d, "support", "libspa-support.so")
         if os.path.exists(p):
             return p
-    found = glob.glob("/usr/lib*/**/pipewire-0.3/libpipewire-module-filter-chain.so", recursive=True)
+    found = glob.glob("/usr/lib*/**/spa-0.2/support/libspa-support.so", recursive=True)
     return found[0] if found else None
 
 
 def available(data_dir=None, hrtf_path=None):
     """(True, "") when everything spatial audio needs is there, else (False, why)."""
-    for tool in ("pipewire", "pw-cli", "pw-dump"):
+    for tool in ("pw-cli", "pw-record", "pw-play", "pw-dump"):
         if not shutil.which(tool):
             return False, f"{tool} not found (PipeWire is needed)"
-    mod = _filter_chain_module()
-    if not mod:
-        return False, "PipeWire filter-chain module not found"
-    try:
-        # the builtin plugins live inside the module; their labels are plain strings in it
-        with open(mod, "rb") as f:
-            blob = f.read()
-        if b"convolver\0" not in blob:
-            return False, "PipeWire filter-chain has no convolver"
-    except OSError as e:
-        return False, f"cannot read {mod}: {e}"
+    if not _null_sink_plugin():
+        return False, "PipeWire's null audio sink (spa support plugin) not found"
     try:
         Mysofa()
     except OSError:
@@ -694,11 +398,72 @@ def available(data_dir=None, hrtf_path=None):
     return True, ""
 
 
+# ------------------------------------------------------------------ command lines
+def _q(s):
+    return json.dumps(str(s))
+
+
+def sink_command(name=OWN_SINK, description=DESCRIPTION):
+    """pw-cli line that creates our 8-channel null sink (gone when that pw-cli exits)."""
+    pos = " ".join(CHANNELS)
+    return (f"create-node adapter {{ factory.name = support.null-audio-sink node.name = {_q(name)} "
+            f"node.description = {_q(description)} media.class = Audio/Sink audio.channels = 8 "
+            f"audio.rate = {RATE} audio.position = [ {pos} ] object.linger = false "
+            f"priority.driver = 1 monitor.channel-volumes = true }}")
+
+
+def capture_command(sink=OWN_SINK):
+    """pw-record of the sink's monitor: f32, 8 channels, WAV container on stdout."""
+    props = (f"{{ stream.capture.sink = true node.name = {_q(sink + '.capture')} "
+             f"node.description = {_q(DESCRIPTION + ' (capture)')} node.dont-reconnect = true "
+             f"application.name = {_q(DESCRIPTION)} }}")
+    return ["pw-record", "--target", sink, "-P", props, "--rate", str(RATE), "--channels", "8",
+            "--channel-map", ",".join(CHANNELS), "--format", "f32", "--latency", str(BLOCK), "-"]
+
+
+def playback_command(output, sink=OWN_SINK):
+    """pw-play of the binaural stereo (raw f32 on stdin) onto `output`, never onto our own sink."""
+    if not output or output == sink:
+        raise ValueError("the spatial output needs a real sink, never itself")
+    props = (f"{{ node.name = {_q(sink + '.output')} node.description = {_q(DESCRIPTION + ' (output)')} "
+             f"node.dont-reconnect = true "
+             f"application.name = {_q(DESCRIPTION)} media.role = Music }}")
+    return ["pw-play", "--target", output, "-P", props, "--rate", str(RATE), "--channels", "2",
+            "--format", "f32", "--latency", str(BLOCK), "-"]
+
+
+def pipe_pending(fd):
+    """Bytes waiting in a pipe (works on both ends on Linux), 0 if unknown."""
+    try:
+        return struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
+    except OSError:
+        return 0
+
+
+def _set_pipe_size(fd, size):
+    try:
+        fcntl.fcntl(fd, F_SETPIPE_SZ, size)
+    except OSError:
+        pass
+
+
+def links_into(dump, src_name, dst_name):
+    """True when node `src_name` has a link into node `dst_name`."""
+    src, dst = find_node(dump, src_name), find_node(dump, dst_name)
+    if src is None or dst is None:
+        return False
+    for o in dump:
+        if str(o.get("type", "")).endswith(":Link"):
+            info = o.get("info") or {}
+            if info.get("output-node-id") == src and info.get("input-node-id") == dst:
+                return True
+    return False
+
+
 # ------------------------------------------------------------------ the running service
 class SpatialAudio:
-    """Owns the filter-chain process, the pw-cli control pipe and the panning worker.
-
-    cfg keys: see DEFAULTS. Typical use:
+    """Owns the sink (pw-cli), the capture (pw-record), the playback (pw-play) and the render
+    thread. cfg keys: see DEFAULTS. Typical use:
         sp = SpatialAudio(cfg, data_dir); sp.start(); sp.set_pose(yaw, pitch) ...; sp.stop()
     """
 
@@ -706,30 +471,38 @@ class SpatialAudio:
         self.cfg = dict(DEFAULTS)
         self.cfg.update({k: v for k, v in (cfg or {}).items() if v is not None})
         self.width = float(self.cfg.get("width") or 30.0)
+        self.sink = str(self.cfg.get("sink_name") or OWN_SINK)
         self.data_dir = data_dir
         self.dir = os.path.join(data_dir, "spatial")
         self.hrtf_path = hrtf_path or self.cfg.get("hrtf") or find_hrtf(data_dir)
         self.output = None
         self.error = None
         self.node_id = None
-        self._proc = None           # pipewire -c filter-chain.conf
-        self._cli = None            # pw-cli (stdin = our set-param lines)
-        self._thread = None
+        self.renderer = None
+        self._hrtf = None
+        self._sink_cli = None       # pw-cli holding the null sink
+        self._rec = None            # pw-record
+        self._play = None           # pw-play
+        self._play_lock = threading.Lock()
+        self._threads = []
         self._lock = threading.Lock()
-        self._wake = threading.Event()
         self._stop = threading.Event()
         self._pose = (0.0, 0.0)
-        self._sent = np.zeros((len(CHANNELS), N_DIRS))   # what PipeWire has
-        self._prev_default = None   # ("configured", name or None) before we changed it
+        self._prev_default = None   # configured default sink before we changed it
         self._changed_default = False
-        self._updates = 0
         self._output_present = True
+        self._sink_present = False
+        self._last_rec_spawn = 0.0
+        self._last_play_spawn = 0.0
+        self._blocks = 0
+        self._dropped = 0
+        self._cpu_s = 0.0
 
     # ---- public API
     def start(self, output_sink=None):
-        """Build the HRIRs and the graph, start PipeWire's filter-chain and the control pipe.
-        Raises RuntimeError (after cleaning up) when it cannot."""
-        if self._proc:
+        """Create the sink, start capture, renderer and playback. Raises RuntimeError (after
+        cleaning up) when it cannot."""
+        if self._sink_cli:
             return
         self._stop.clear()
         self.error = None
@@ -742,8 +515,7 @@ class SpatialAudio:
 
     def set_pose(self, yaw, pitch):
         """Latest head pose (degrees; yaw + = turned right, pitch + = looking up). Cheap and
-        thread-safe; the worker smooths it and sends gains at most 100 times a second. Never
-        raises."""
+        thread-safe; the renderer smooths it and uses it at the next block. Never raises."""
         try:
             y, p = float(yaw), float(pitch)
             if not (math.isfinite(y) and math.isfinite(p)):
@@ -752,155 +524,253 @@ class SpatialAudio:
             return
         with self._lock:
             self._pose = (y, p)
-        self._wake.set()
 
     def set_output(self, output_sink=None):
-        """Render onto another sink (e.g. the AirPods just connected): restarts the filter, keeps
-        the default-sink bookkeeping so stop() still restores the original default."""
-        prev = (self._prev_default, self._changed_default)
-        pose = self._pose
-        self._teardown(restore_default=False)
-        self._prev_default, self._changed_default = prev
-        self._pose = pose
-        self.start(output_sink)
+        """Render onto another sink (e.g. the AirPods just connected). Only the playback
+        stream is restarted; None = pick again (AirPods, else the default sink)."""
+        out = output_sink or find_output_sink(True)
+        if not out or out == self.sink:
+            self.error = "no output sink to render onto"
+            return
+        self.output = out
+        self._output_present = True
+        self.error = None
+        self._kill_play()               # the render thread starts a new one at the next block
 
     def stop(self):
         """Stop everything and give the previous default sink back. Safe to call twice."""
         self._teardown(restore_default=True)
 
     def status(self):
-        alive = bool(self._proc and self._proc.poll() is None)
+        alive = bool(self._sink_cli and self._sink_cli.poll() is None
+                     and any(t.is_alive() for t in self._threads))
         return {"active": alive and self.node_id is not None, "output": self.output,
-                "error": self.error, "directions": N_DIRS, "node_id": self.node_id,
-                "output_present": self._output_present, "updates": self._updates,
-                "hrtf": os.path.basename(self.hrtf_path) if self.hrtf_path else None}
+                "error": self.error, "directions": "any",
+                "node_id": self.node_id, "output_present": self._output_present,
+                "blocks": self._blocks, "dropped": self._dropped,
+                "render_cpu_s": round(self._cpu_s, 3),
+                "hrtf": os.path.basename(self.hrtf_path) if self.hrtf_path else None,
+                "intensity": self.renderer.intensity if self.renderer else None}
 
     # ---- start / stop internals
     def _start(self, output_sink):
-        if not shutil.which("pipewire") or not shutil.which("pw-cli"):
-            raise RuntimeError("PipeWire (pipewire, pw-cli) not found")
+        for tool in ("pw-cli", "pw-record", "pw-play", "pw-dump"):
+            if not shutil.which(tool):
+                raise RuntimeError(f"{tool} not found (PipeWire is needed)")
         if not self.hrtf_path or not os.path.exists(self.hrtf_path):
             raise RuntimeError("no HRTF (.sofa) file found")
         os.makedirs(self.dir, exist_ok=True)
-        self._kill_stale()
-        meta = build_hrir_cache(self.hrtf_path, os.path.join(self.dir, "hrir"))
+        mysofa = Mysofa()
+        eq = eq_for(self.hrtf_path, self.dir, RATE, mysofa)
+        self._hrtf = SofaHrtf(self.hrtf_path, RATE, mysofa)
+        self.renderer = sr.Renderer(self._hrtf, eq, width=self.width,
+                                    intensity=float(self.cfg.get("intensity", 0.75)),
+                                    gain_db=float(self.cfg.get("gain_db") or 0.0))
         dump = pw_dump()
-        if find_node(dump, OWN_SINK) is not None:
-            raise RuntimeError("another MousePods Spatial sink is already running")
+        if find_node(dump, self.sink) is not None:
+            raise RuntimeError(f"a sink named {self.sink} already exists")
         out = output_sink or self.cfg.get("output") or find_output_sink(True, dump)
-        if not out or out in (OWN_SINK, OWN_OUTPUT):
+        if not out or out == self.sink:
             raise RuntimeError("no output sink to render onto")
         self.output = out
-        gain = 10 ** (float(self.cfg.get("gain_db") or 0.0) / 20.0) / meta["factor"]
-        with self._lock:
-            yaw, pitch = self._pose
-        initial = gain_matrix(yaw, pitch, self.width)
-        initial = np.where(initial < THRESHOLD, 0.0, initial)
-        conf = build_conf(meta["files"], gain, out, initial, int(self.cfg.get("blocksize") or 256))
-        xdg = os.path.join(self.dir, "xdg")
-        confd = os.path.join(xdg, "pipewire", "filter-chain.conf.d")
-        os.makedirs(confd, exist_ok=True)
-        for old in glob.glob(os.path.join(confd, "*.conf")):
-            os.remove(old)
-        with open(os.path.join(confd, "mousepods-spatial.conf"), "w") as f:
-            f.write(conf)
-        env = dict(os.environ, XDG_CONFIG_HOME=xdg)
-        logf = open(os.path.join(self.dir, "pipewire.log"), "wb")
-        try:
-            self._proc = subprocess.Popen(["pipewire", "-c", "filter-chain.conf"], env=env,
-                                          stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
-                                          start_new_session=True)
-        finally:
-            logf.close()
-        with open(os.path.join(self.dir, "pipewire.pid"), "w") as f:
-            f.write(str(self._proc.pid))
-        # wait for the sink to appear
+        # the sink: lives as long as this pw-cli
+        self._sink_cli = subprocess.Popen(["pw-cli"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL, start_new_session=True)
+        self._sink_cli.stdin.write((sink_command(self.sink) + "\n").encode())
+        self._sink_cli.stdin.flush()
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
-                raise RuntimeError("PipeWire filter-chain exited: " + self._log_tail())
-            self.node_id = find_node(pw_dump(), OWN_SINK)
+            if self._sink_cli.poll() is not None:
+                raise RuntimeError("pw-cli exited while creating the sink")
+            self.node_id = find_node(pw_dump(), self.sink)
             if self.node_id is not None:
                 break
-            time.sleep(0.15)
+            time.sleep(0.1)
         if self.node_id is None:
-            raise RuntimeError("the MousePods Spatial sink did not appear: " + self._log_tail())
-        self._sent = initial.copy()
-        self._spawn_cli()
+            raise RuntimeError("the MousePods Spatial sink did not appear")
+        self._sink_present = True
         if self.cfg.get("make_default", True):
             self._make_default(dump)
         self._output_present = True
-        self._thread = threading.Thread(target=self._worker, name="spatial-audio", daemon=True)
-        self._thread.start()
+        self._threads = [threading.Thread(target=self._render_loop, name="spatial-render", daemon=True),
+                         threading.Thread(target=self._health_loop, name="spatial-health", daemon=True)]
+        for t in self._threads:
+            t.start()
         _live.add(self)
-        log.info("spatial audio: node %s, output %s, IR %d samples", self.node_id, out, meta["length"])
-
-    def _spawn_cli(self):
-        self._cli = subprocess.Popen(["pw-cli"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, start_new_session=True)
+        log.info("spatial audio: sink %s (node %s), output %s", self.sink, self.node_id, out)
 
     def _teardown(self, restore_default):
         self._stop.set()
-        self._wake.set()
-        t = self._thread
-        if t and t is not threading.current_thread():
-            t.join(timeout=2.0)
-        self._thread = None
-        cli, self._cli = self._cli, None
+        for p in (self._rec, self._play):         # unblocks the render thread's read / write
+            if p:
+                _terminate(p, group=True)
+        for t in self._threads:
+            if t is not threading.current_thread():
+                t.join(timeout=3.0)
+        self._threads = []
+        self._kill_play()
+        rec, self._rec = self._rec, None
+        if rec:
+            _terminate(rec, group=True)
+        cli, self._sink_cli = self._sink_cli, None
         if cli:
-            try:
+            try:                                # pw-cli quits, the sink goes with it
+                cli.stdin.write(b"quit\n")
                 cli.stdin.close()
             except OSError:
                 pass
-            _terminate(cli, group=True)
-        proc, self._proc = self._proc, None
-        if proc:
-            _terminate(proc, group=True)
             try:
-                os.remove(os.path.join(self.dir, "pipewire.pid"))
-            except OSError:
-                pass
+                cli.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                _terminate(cli, group=True)
+        if self._hrtf:
+            self._hrtf.close()
+            self._hrtf = None
         self.node_id = None
+        self._sink_present = False
         if restore_default and self._changed_default:
             self._restore_default()
         _live.discard(self)
 
-    def _kill_stale(self):
-        """A previous MousePods that crashed may have left its filter process: stop it, but only
-        if it really is our pipewire (same command line and private XDG_CONFIG_HOME)."""
-        pid_file = os.path.join(self.dir, "pipewire.pid")
-        try:
-            pid = int(open(pid_file).read().strip())
-            cmd = open(f"/proc/{pid}/cmdline", "rb").read()
-            env = open(f"/proc/{pid}/environ", "rb").read()
-        except (OSError, ValueError):
-            return
-        xdg = os.fsencode("XDG_CONFIG_HOME=" + os.path.join(self.dir, "xdg"))
-        if b"pipewire\0" in cmd and b"filter-chain.conf" in cmd and xdg in env.split(b"\0"):
-            log.info("spatial audio: stopping a stale filter process (%d)", pid)
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except OSError:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-            for _ in range(20):
-                if not os.path.exists(f"/proc/{pid}"):
-                    break
-                time.sleep(0.1)
-        try:
-            os.remove(pid_file)
-        except OSError:
-            pass
+    # ---- streams
+    def _spawn_rec(self):
+        self._last_rec_spawn = time.monotonic()
+        p = subprocess.Popen(capture_command(self.sink), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             start_new_session=True, bufsize=0)
+        _set_pipe_size(p.stdout.fileno(), 65536)
+        info, left = sr.read_stream_header(p.stdout.read)
+        if info["channels"] not in (None, 8):
+            _terminate(p, group=True)
+            raise RuntimeError(f"capture has {info['channels']} channels")
+        self._rec, self._rec_info, self._rec_left = p, info, left
 
-    def _log_tail(self):
+    def _spawn_play(self):
+        self._last_play_spawn = time.monotonic()
+        p = subprocess.Popen(playback_command(self.output, self.sink), stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, bufsize=0)
+        _set_pipe_size(p.stdin.fileno(), 16384)
+        p.stdin.write(sr.encode_f32(np.zeros((BLOCK * PREFILL_BLOCKS, 2))))
+        with self._play_lock:
+            self._play = p
+
+    def _kill_play(self):
+        with self._play_lock:
+            p, self._play = self._play, None
+        if p:
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
+            _terminate(p, group=True)
+
+    def _read_block(self):
+        """One block of 8-channel frames from pw-record, or None when the stream ended."""
+        info = self._rec_info
+        size = BLOCK * 8 * np.dtype(info["dtype"]).itemsize
+        fd = self._rec.stdout
+        # fell behind (CPU hiccup, clock drift): throw whole blocks away instead of lagging
+        while pipe_pending(fd.fileno()) > MAX_PIPE_BLOCKS * size:
+            if len(fd.read(size)) < size:
+                return None
+            self._dropped += 1
+        buf = self._rec_left
+        while len(buf) < size:
+            chunk = fd.read(size - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        self._rec_left = buf[size:]
+        return sr.decode_frames(buf[:size], info["dtype"], 8)
+
+    def _write_block(self, out):
+        """Send one rendered block to pw-play; (re)start it when needed. Never raises."""
+        with self._play_lock:
+            p = self._play
+        if p is None or p.poll() is not None:
+            if p is not None:
+                self._kill_play()
+            if (self._stop.is_set() or not self._output_present
+                    or time.monotonic() - self._last_play_spawn < RESPAWN_S):
+                return
+            try:
+                self._spawn_play()
+            except (OSError, ValueError) as e:
+                self.error = f"pw-play: {e}"
+                return
+            with self._play_lock:
+                p = self._play
+        data = sr.encode_f32(out)
         try:
-            with open(os.path.join(self.dir, "pipewire.log"), "rb") as f:
-                lines = f.read().decode(errors="replace").strip().splitlines()
-            return " | ".join(lines[-3:]) or "no message"
-        except OSError:
-            return "no log"
+            if pipe_pending(p.stdin.fileno()) > MAX_PIPE_BLOCKS * len(data):
+                self._dropped += 1            # the output is slower than us: shorten the queue
+                return
+            p.stdin.write(data)
+        except (OSError, ValueError):
+            self._kill_play()
+
+    def _render_loop(self):
+        while not self._stop.is_set():
+            try:
+                if self._rec is None or self._rec.poll() is not None:
+                    if self._rec is not None:
+                        _terminate(self._rec, group=True)
+                        self._rec = None
+                    wait = RESPAWN_S - (time.monotonic() - self._last_rec_spawn)
+                    if self._stop.wait(max(0.0, wait)):
+                        break
+                    self._spawn_rec()
+                x = self._read_block()
+                if x is None:
+                    if self._rec is not None:
+                        _terminate(self._rec, group=True)
+                    self._rec = None
+                    continue
+                with self._lock:
+                    yaw, pitch = self._pose
+                t0 = time.thread_time()
+                out = self.renderer.process(x, yaw, pitch)
+                self._cpu_s += time.thread_time() - t0
+                self._blocks += 1
+                self._write_block(out)
+            except EOFError:
+                self._rec = None
+            except Exception as e:  # noqa: BLE001  (never let the render thread die)
+                if not self._stop.is_set():
+                    self.error = f"spatial render: {e}"
+                    log.warning("spatial audio: %s", e)
+                    self._stop.wait(0.5)
+
+    def _health_loop(self):
+        while not self._stop.wait(HEALTH_S):
+            try:
+                self._health()
+            except Exception as e:  # noqa: BLE001
+                self.error = f"spatial health: {e}"
+
+    def _health(self):
+        if self._sink_cli is None or self._sink_cli.poll() is not None:
+            self.error = "the MousePods Spatial sink is gone (pw-cli exited)"
+            self._sink_present = False
+            return
+        dump = pw_dump()
+        if not dump:
+            return
+        self._sink_present = find_node(dump, self.sink) is not None
+        if not self._sink_present:
+            self.error = "the MousePods Spatial sink disappeared"
+            return
+        # never let our output feed our own input (it would howl)
+        if links_into(dump, self.sink + ".output", self.sink):
+            log.warning("spatial audio: output was linked into its own sink, stopping it")
+            self._kill_play()
+        present = find_node(dump, self.output) is not None
+        if present != self._output_present:
+            self._output_present = present
+            self.error = None if present else f"output {self.output} is gone"
+            if not present:
+                self._kill_play()
 
     # ---- default sink
     def _make_default(self, dump):
@@ -909,7 +779,7 @@ class SpatialAudio:
             self._prev_default = default_metadata(dump, "default.configured.audio.sink")
         ok = False
         if shutil.which("pactl"):
-            ok = _run_ok(["pactl", "set-default-sink", OWN_SINK])
+            ok = _run_ok(["pactl", "set-default-sink", self.sink])
         if not ok and shutil.which("wpctl"):
             ok = _run_ok(["wpctl", "set-default", str(self.node_id)])
         if ok:
@@ -920,7 +790,7 @@ class SpatialAudio:
     def _restore_default(self):
         self._changed_default = False
         now = default_metadata(pw_dump(), "default.configured.audio.sink")
-        if now not in (None, OWN_SINK):
+        if now not in (None, self.sink):
             return                      # the user picked another output meanwhile: leave it
         prev = self._prev_default
         if shutil.which("pw-metadata"):
@@ -933,73 +803,6 @@ class SpatialAudio:
                 return
         if prev and shutil.which("pactl"):
             _run_ok(["pactl", "set-default-sink", prev])
-
-    # ---- worker: pose -> gains -> set-param
-    def _worker(self):
-        period = 1.0 / UPDATE_HZ
-        next_health = time.monotonic() + HEALTH_S
-        smooth = None
-        busy = False                    # still gliding towards the target: do not sleep
-        while not self._stop.is_set():
-            if not busy:
-                self._wake.wait(timeout=1.0)
-            self._wake.clear()
-            if self._stop.is_set():
-                break
-            t0 = time.monotonic()
-            try:
-                with self._lock:
-                    target = self._pose
-                smooth = smooth_pose(smooth, target, period)
-                want = gain_matrix(smooth[0], smooth[1], self.width)
-                busy = self._send(want) or smooth != tuple(target)
-                if t0 >= next_health:
-                    next_health = t0 + HEALTH_S
-                    self._health()
-            except Exception as e:  # noqa: BLE001  (never let the worker die silently)
-                self.error = f"spatial worker: {e}"
-                log.warning("spatial audio: %s", e)
-                busy = False
-            dt = time.monotonic() - t0
-            if dt < period:
-                self._stop.wait(period - dt)
-
-    def _send(self, want):
-        """Move PipeWire's gains towards `want` (at most MAX_STEP each). Returns True while
-        they have not reached it yet."""
-        step = limit_step(self._sent, want)
-        ups = diff_updates(self._sent, step)
-        if ups and self.node_id is not None:
-            cli = self._cli
-            if cli is None or cli.poll() is not None:
-                self._spawn_cli()           # pw-cli died: one new try per update
-                cli = self._cli
-            try:
-                for line in set_param_lines(self.node_id, ups):
-                    cli.stdin.write((line + "\n").encode())
-                    cli.stdin.flush()
-            except (OSError, ValueError) as e:
-                self.error = f"pw-cli: {e}"
-                return False
-            for d, k, v in ups:
-                self._sent[k, d] = v
-            self._updates += 1
-        goal = np.where(np.asarray(want) < THRESHOLD, 0.0, want)
-        return bool(np.any(np.abs(goal - self._sent) > THRESHOLD))
-
-    def _health(self):
-        if self._proc is None or self._proc.poll() is not None:
-            self.error = "PipeWire filter-chain stopped: " + self._log_tail()
-            return
-        dump = pw_dump()
-        if not dump:
-            return
-        if find_node(dump, OWN_SINK) is None:
-            self.error = "the MousePods Spatial sink disappeared"
-        present = find_node(dump, self.output) is not None
-        if present != self._output_present:
-            self._output_present = present
-            self.error = None if present else f"output {self.output} is gone"
 
 
 def _run_ok(args, timeout=3.0):

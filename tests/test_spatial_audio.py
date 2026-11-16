@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests of spatial_audio.py: directions, panning, head rotation, graph text, update diffs, WAV
-files, HRIR extraction (libmysofa mocked). No audio hardware and no PipeWire needed.
+"""Tests of spatial audio (spatial_audio.py + spatial_render.py): head rotation, binaural
+renderer (overlap-add, old/new HRIR crossfade, loudness, downmix, intensity, silence skipping,
+LFE, limiter), stream containers, diffuse-field EQ, libmysofa (mocked), command lines and the
+pipe plumbing with fake processes. No audio hardware and no PipeWire needed.
 
 Run:  python -m unittest tests.test_spatial_audio -v
 """
 import math
 import os
-import re
+import struct
 import sys
 import tempfile
 import unittest
@@ -15,297 +17,342 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import spatial_audio as sa  # noqa: E402
+import spatial_render as sr  # noqa: E402
+
+B = sr.BLOCK
+KEMAR = os.path.expanduser("~/.local/share/mousepods/hrtf/mit_kemar_normal_pinna.sofa")
 
 
-def idx(az, el):
-    """Index of the fixed direction (az, el)."""
-    for i, (a, e) in enumerate(sa.DIRECTIONS):
-        if abs(e - el) < 1e-9 and abs(((a - az) + 180) % 360 - 180) < 1e-9:
-            return i
-    raise KeyError((az, el))
+class FakeHrtf:
+    """Pure delay + gain per ear, both depending on the direction: big HRIR changes when the head
+    moves, easy to predict."""
+    L = 64
+
+    def __init__(self):
+        self.calls = 0
+
+    def params(self, az, el):
+        s = math.sin(math.radians(az))
+        dl = 20 + int(round(8 * (1 - s)))         # source on the left: left ear earlier
+        dr = 20 + int(round(8 * (1 + s)))
+        return dl, dr, 0.6 + 0.3 * s, 0.6 - 0.3 * s
+
+    def __call__(self, az, el):
+        self.calls += 1
+        dl, dr, gl, gr = self.params(az, el)
+        h = np.zeros((2, self.L))
+        h[0, dl], h[1, dr] = gl, gr
+        return h
 
 
-class Directions(unittest.TestCase):
-    def test_rings(self):
-        self.assertEqual(sa.N_DIRS, 60)
-        self.assertEqual(len(sa.DIRECTIONS), 60)
-        els = [e for _, e in sa.DIRECTIONS]
-        self.assertEqual((els.count(-30.0), els.count(0.0), els.count(30.0)), (12, 36, 12))
-        mid = sorted(a % 360 for a, e in sa.DIRECTIONS if e == 0.0)
-        self.assertEqual(mid, [i * 10.0 for i in range(36)])
-        for az in (0, 30, -30):                       # FC, FL, FR at rest sit on a direction
-            idx(az, 0)
-        for a, _ in sa.DIRECTIONS:
-            self.assertTrue(-180 < a <= 180)
+def renderer(**kw):
+    args = dict(eq=None, intensity=1.0, binaural_gain=1.0, dry_delay=0)
+    args.update(kw)
+    fetch = args.pop("fetch", None) or FakeHrtf()
+    return sr.Renderer(fetch, **args)
 
 
-class Panning(unittest.TestCase):
-    def energy(self, g):
-        return sum(x * x for x in g)
-
-    def test_energy_is_one_everywhere(self):
-        for az in range(-360, 361, 7):
-            for el in (-90, -40, -30, -17, 0, 5, 15, 29, 30, 60):
-                self.assertAlmostEqual(self.energy(sa.gains_for(az, el)), 1.0, places=9)
-
-    def test_front(self):
-        g = sa.gains_for(0, 0)
-        self.assertAlmostEqual(g[idx(0, 0)], 1.0)
-        self.assertAlmostEqual(sum(abs(x) for x in g), 1.0)
-
-    def test_between_two_neighbours(self):
-        g = sa.gains_for(5, 0)
-        a, b = g[idx(0, 0)], g[idx(10, 0)]
-        self.assertAlmostEqual(a, math.cos(math.pi / 4))
-        self.assertAlmostEqual(b, math.sin(math.pi / 4))
-        self.assertAlmostEqual(sum(x for i, x in enumerate(g) if i not in (idx(0, 0), idx(10, 0))), 0.0)
-        # closer to 10 -> more of it
-        g = sa.gains_for(8, 0)
-        self.assertGreater(g[idx(10, 0)], g[idx(0, 0)])
-
-    def test_wraps_at_180(self):
-        self.assertEqual(sa.gains_for(180, 0), sa.gains_for(-180, 0))
-        self.assertAlmostEqual(sa.gains_for(180, 0)[idx(180, 0)], 1.0)
-        g = sa.gains_for(-177, 0)          # between 180 and -170
-        self.assertGreater(g[idx(180, 0)], 0.5)
-        self.assertGreater(g[idx(-170, 0)], 0.1)
-        for a, b in zip(sa.gains_for(183, 0), sa.gains_for(-177, 0)):
-            self.assertAlmostEqual(a, b)
-
-    def test_elevation_blend(self):
-        g = sa.gains_for(0, 15)            # halfway between ring 0 and ring +30
-        self.assertAlmostEqual(g[idx(0, 0)], math.cos(math.pi / 4))
-        self.assertAlmostEqual(g[idx(0, 30)], math.sin(math.pi / 4))
-        g = sa.gains_for(0, -30)
-        self.assertAlmostEqual(g[idx(0, -30)], 1.0)
-        self.assertEqual(sa.gains_for(0, 80), sa.gains_for(0, 30))     # clamped
-        self.assertEqual(sa.gains_for(10, -80), sa.gains_for(10, -30))
-        g = sa.gains_for(20, 10)           # on ring 0 at 20, only partly up
-        self.assertGreater(g[idx(20, 0)], 0.5)
-        self.assertGreater(g[idx(0, 30)] + g[idx(30, 30)], 0.1)
+def run(r, x, poses=None):
+    out = []
+    for i in range(len(x) // B):
+        yaw, pitch = poses[i] if poses else (0.0, 0.0)
+        out.append(r.process(x[i * B:(i + 1) * B], yaw, pitch))
+    return np.concatenate(out).astype(np.float64)
 
 
 class HeadRotation(unittest.TestCase):
     def test_yaw_right_moves_sources_left(self):
-        az, el = sa.relative_direction(0, 0, 30, 0)
+        az, el = sr.relative_direction(0, 0, 30, 0)
         self.assertAlmostEqual(az, 30)
         self.assertAlmostEqual(el, 0)
-        m = sa.gain_matrix(yaw=30)
-        fc = sa.CHANNELS.index("FC")
-        self.assertAlmostEqual(np.sum(m[fc] ** 2), 1.0)
-        self.assertAlmostEqual(m[fc, idx(30, 0)], 1.0)                     # at +30 (left)
 
     def test_yaw_matches_simple_formula(self):
         for src in (0, 30, -30, 90, 150, -150):
             for yaw in (-120, -45, 10, 90):
-                az, el = sa.relative_direction(src, 0, yaw, 0)
+                az, el = sr.relative_direction(src, 0, yaw, 0)
                 self.assertAlmostEqual((az - (src + yaw) + 180) % 360 - 180, 0, places=9)
                 self.assertAlmostEqual(el, 0, places=9)
 
     def test_pitch(self):
-        self.assertAlmostEqual(sa.relative_direction(0, 0, 0, 20)[1], -20)   # look up: front goes down
-        self.assertAlmostEqual(sa.relative_direction(180, 0, 0, 20)[1], 20)  # ... and behind goes up
-        az, el = sa.relative_direction(90, 0, 0, 20)                         # side barely moves
+        self.assertAlmostEqual(sr.relative_direction(0, 0, 0, 20)[1], -20)   # look up: front goes down
+        self.assertAlmostEqual(sr.relative_direction(180, 0, 0, 20)[1], 20)  # ... and behind goes up
+        az, el = sr.relative_direction(90, 0, 0, 20)                         # side barely moves
         self.assertAlmostEqual(az, 90)
         self.assertAlmostEqual(el, 0)
 
-    def test_layout(self):
-        spk = sa.speakers(40)
-        self.assertEqual(spk["FL"][:2], (40.0, 0.0))
-        self.assertEqual(spk["FR"][:2], (-40.0, 0.0))
-        self.assertEqual(spk["LFE"], (0.0, -30.0, 0.5))
-        m = sa.gain_matrix()
-        self.assertAlmostEqual(np.sum(m[sa.CHANNELS.index("LFE")] ** 2), 0.25)
-        self.assertAlmostEqual(m[sa.CHANNELS.index("SL"), idx(90, 0)], 1.0)
-        self.assertAlmostEqual(m[sa.CHANNELS.index("SR"), idx(-90, 0)], 1.0)
-
-
-class Conf(unittest.TestCase):
-    def conf(self, sink="bluez_output.40_DA_5C_BD_69_73.1"):
-        files = [f"/x/dir{i:02d}.wav" for i in range(sa.N_DIRS)]
-        return sa.build_conf(files, 1.5, sink, sa.gain_matrix(), 256)
-
-    def test_structure(self):
-        c = self.conf()
-        nodes = re.findall(r"label = (\w+) name = (\S+)", c)
-        names = [n for _, n in nodes]
-        self.assertEqual(len(names), len(set(names)))                         # unique names
-        self.assertEqual(sum(1 for lab, n in nodes if lab == "mixer" and re.fullmatch(r"m\d+", n)), 60)
-        self.assertEqual(sum(1 for lab, _ in nodes if lab == "convolver"), 120)
-        self.assertIn('outputs = [ "sl:Out" "sr:Out" ]', c)
-        self.assertIn('inputs = [ "cFL:In" "cFR:In" "cFC:In" "cLFE:In" "cRL:In" "cRR:In" "cSL:In" "cSR:In" ]', c)
-        self.assertIn('node.name = "mousepods_spatial"', c)
-        self.assertIn('node.description = "MousePods Spatial"', c)
-        self.assertIn("media.class = Audio/Sink", c)
-        self.assertIn("audio.position = [ FL FR FC LFE RL RR SL SR ]", c)
-        self.assertIn('node.name = "mousepods_spatial.output"', c)
-        self.assertIn("node.passive = true", c)
-        self.assertIn('target.object = "bluez_output.40_DA_5C_BD_69_73.1"', c)
-        self.assertIn("blocksize = 256", c)
-        self.assertIn("gain = 1.500000", c)
-
-    def test_links(self):
-        c = self.conf()
-        links = re.findall(r'\{ output = "([^"]+)" input = "([^"]+)" \}', c)
-        inputs = [i for _, i in links]
-        self.assertEqual(len(inputs), len(set(inputs)))                      # an input has one link
-        # every direction mixer gets all 8 channels, each ear convolver its mixer
-        for d in range(sa.N_DIRS):
-            for k in range(8):
-                self.assertIn(f"m{d}:In {k + 1}", inputs)
-            self.assertIn((f"m{d}:Out", f"l{d}:In"), links)
-            self.assertIn((f"m{d}:Out", f"r{d}:In"), links)
-        # no output fans out to more than 4 inputs (PipeWire 1.2.4 crashes with large fan-outs)
-        fan = {}
-        for o, _ in links:
-            fan[o] = fan.get(o, 0) + 1
-        self.assertLessEqual(max(fan.values()), 4)
-        # the copy tree really brings channel k to "In k+1": follow it back to the source
-        src = {i: o for o, i in links}
-        for d in (0, 17, 59):
-            for k, ch in enumerate(sa.CHANNELS):
-                port = src[f"m{d}:In {k + 1}"]
-                while not port.startswith("c"):
-                    port = src[port.replace(":Out", ":In")]
-                self.assertEqual(port, f"c{ch}:Out")
-        # sum trees: 60 left and 60 right convolvers reach sl / sr (8 mixers of <= 8, then 1)
-        self.assertEqual(sum(1 for o, i in links if re.fullmatch(r"l\d+:Out", o) and i.startswith("sl0_")), 60)
-        self.assertEqual(sum(1 for o, i in links if re.fullmatch(r"r\d+:Out", o) and i.startswith("sr0_")), 60)
-        self.assertEqual(sum(1 for o, i in links if re.fullmatch(r"sl0_\d:Out", o) and i.startswith("sl:In")), 8)
-        self.assertEqual(sum(1 for o, i in links if re.fullmatch(r"sr0_\d:Out", o) and i.startswith("sr:In")), 8)
-        self.assertLessEqual(max(int(i.rsplit(" ", 1)[1]) for _, i in links if ":In " in i), 8)
-
-    def test_initial_gains_in_controls(self):
-        c = self.conf()
-        m_fc = re.search(r"name = m%d control = \{([^}]*)\}" % idx(0, 0), c).group(1)
-        self.assertIn('"Gain 3" = 1.000000', m_fc)                       # FC straight ahead
-        self.assertIn('"Gain 1" = 0.000000', m_fc)
-
-    def test_never_targets_itself(self):
-        for bad in (None, "", sa.OWN_SINK, sa.OWN_OUTPUT):
-            with self.assertRaises(ValueError):
-                self.conf(bad)
-
-
-class Updates(unittest.TestCase):
-    def test_threshold_and_stale_zeroes(self):
-        last = np.zeros((8, 32))
-        last[0, 1] = 0.5
-        last[1, 2] = 0.3
-        last[2, 3] = 0.01
-        new = last.copy()
-        new[0, 1] = 0.5015           # below threshold: not sent
-        new[1, 2] = 0.31             # sent
-        new[2, 3] = 0.0015           # fell under the threshold: sent as exact 0
-        new[3, 4] = 0.001            # tiny new gain: stays 0, not sent
-        ups = sa.diff_updates(last, new)
-        self.assertEqual(sorted(ups), sorted([(2, 1, 0.31), (3, 2, 0.0)]))
-
-    def test_no_change_no_line(self):
-        m = sa.gain_matrix(10, 5)
-        self.assertEqual(sa.diff_updates(m, m), [])
-
-    def test_lines(self):
-        lines = sa.set_param_lines(88, [(0, 0, 0.5), (31, 7, 0.0)])
-        self.assertEqual(lines, ['set-param 88 Props { params = [ "m0:Gain 1" 0.5000 "m31:Gain 8" 0.0000 ] }'])
-        # a full update (every gain) is split under pw-cli's 4 KiB input buffer
-        ups = [(d, k, 0.123456) for d in range(sa.N_DIRS) for k in range(8)]
-        lines = sa.set_param_lines(88, ups)
-        self.assertGreater(len(lines), 1)
-        self.assertTrue(all(len(x) <= sa.MAX_LINE for x in lines))
-        self.assertEqual(sum(x.count(":Gain") for x in lines), 8 * sa.N_DIRS)
-
-    def test_worker_send_tracks_state(self):
-        sp = sa.SpatialAudio({}, tempfile.mkdtemp())
-        sp.node_id = 7
-
-        class Pipe:
-            def __init__(self):
-                self.data = b""
-
-            def write(self, b):
-                self.data += b
-
-            def flush(self):
-                pass
-
-        class Cli:
-            stdin = Pipe()
-
-            def poll(self):
-                return None
-
-        sp._cli = Cli()
-        sp._sent = sa.gain_matrix(0, 0)
-        want = sa.gain_matrix(30, 0)
-        prev, n = sp._sent.copy(), 0
-        while sp._send(want):                                            # glides, MAX_STEP at a time
-            self.assertLessEqual(np.max(np.abs(sp._sent - prev)), sa.MAX_STEP + 1e-9)
-            prev, n = sp._sent.copy(), n + 1
-            self.assertLess(n, 100)
-        self.assertGreater(n, 5)
-        text = sp._cli.stdin.data.decode()
-        self.assertTrue(text.startswith("set-param 7 Props"))
-        self.assertTrue(np.allclose(np.where(want < sa.THRESHOLD, 0, want), sp._sent, atol=sa.THRESHOLD))
-        before, updates = len(sp._cli.stdin.data), sp._updates
-        self.assertFalse(sp._send(want))                                 # reached: nothing more
-        self.assertEqual(len(sp._cli.stdin.data), before)
-        self.assertEqual(sp._updates, updates)
-
-    def test_limit_step(self):
-        last = np.zeros((2, 3))
-        new = np.array([[1.0, 0.01, -1.0], [0.0, 0.5, 0.03]])
-        out = sa.limit_step(last, new, 0.04)
-        self.assertTrue(np.allclose(out, [[0.04, 0.01, -0.04], [0.0, 0.04, 0.03]]))
+    def test_round_direction(self):
+        self.assertEqual(sr.round_direction(29.6, 0.4), (30, 0))
+        self.assertEqual(sr.round_direction(-180.2, 0), (180, 0))
+        self.assertEqual(sr.round_direction(190, 0), (-170, 0))
+        self.assertEqual(sr.round_direction(57, 95), (0, 90))
 
     def test_smooth_pose(self):
-        self.assertEqual(sa.smooth_pose(None, (10, 5), 0.01), (10, 5))
-        p = sa.smooth_pose((0.0, 0.0), (10.0, -10.0), 0.01, 0.05)
+        self.assertEqual(sr.smooth_pose(None, (10, 5), 0.01), (10, 5))
+        p = sr.smooth_pose((0.0, 0.0), (10.0, -10.0), 0.01, 0.05)
         a = 1 - math.exp(-0.01 / 0.05)
         self.assertAlmostEqual(p[0], 10 * a)
         self.assertAlmostEqual(p[1], -10 * a)
-        p = sa.smooth_pose((175.0, 0.0), (-175.0, 0.0), 0.01, 0.05)      # short way through 180
+        p = sr.smooth_pose((175.0, 0.0), (-175.0, 0.0), 0.01, 0.05)      # short way through 180
         self.assertGreater(p[0], 175.0)
         p = (0.0, 0.0)
-        for _ in range(100):                                             # 1 s: there
-            p = sa.smooth_pose(p, (40.0, 10.0), 0.01, 0.05)
+        for _ in range(100):
+            p = sr.smooth_pose(p, (40.0, 10.0), 0.01, 0.05)
         self.assertEqual(p, (40.0, 10.0))
 
-    def test_set_pose_ignores_garbage(self):
-        sp = sa.SpatialAudio({}, tempfile.mkdtemp())
-        sp.set_pose(float("nan"), 0)
-        sp.set_pose(None, 0)
-        self.assertEqual(sp._pose, (0.0, 0.0))
-        sp.set_pose(12, -3)
-        self.assertEqual(sp._pose, (12.0, -3.0))
-        st = sp.status()
-        self.assertFalse(st["active"])
-        self.assertEqual(st["directions"], sa.N_DIRS)
+    def test_layout(self):
+        spk = sr.speakers(40)
+        self.assertEqual(spk["FL"][:2], (40.0, 0.0))
+        self.assertEqual(spk["FR"][:2], (-40.0, 0.0))
+        self.assertEqual(spk["SL"][:2], (90.0, 0.0))
+        self.assertEqual(spk["RR"][:2], (-150.0, 0.0))
 
 
-class Wav(unittest.TestCase):
-    def test_roundtrip(self):
-        d = tempfile.mkdtemp()
-        p = os.path.join(d, "x.wav")
-        x = np.vstack([np.linspace(-0.98, 0.98, 500), np.sin(np.arange(500) / 7) * 0.5])
-        sa.write_wav(p, x, 48000)
-        y, rate = sa.read_wav(p)
-        self.assertEqual(rate, 48000)
-        self.assertEqual(y.shape, (2, 500))
-        self.assertLess(np.max(np.abs(x - y)), 1e-8)
+class Render(unittest.TestCase):
+    def test_overlap_add_equals_direct_convolution(self):
+        rng = np.random.default_rng(3)
+        n = 12 * B
+        x = np.zeros((n, 8))
+        x[:, 2] = rng.normal(0, 0.05, n)                 # FC
+        fetch = FakeHrtf()
+        y = run(renderer(fetch=fetch), x)
+        h = fetch(0, 0)
+        for ear in (0, 1):
+            ref = np.convolve(x[:, 2], h[ear])[:n]
+            self.assertLess(np.max(np.abs(y[:, ear] - ref)), 1e-6)
 
-    def test_normalise(self):
-        irs = np.zeros((2, 2, 10))
-        irs[0, 0, 3] = 2.0
-        irs[1, 1, 4] = -0.5
-        out, k = sa.normalise(irs)
-        self.assertAlmostEqual(np.max(np.abs(out)), 0.98)
-        self.assertAlmostEqual(k, 0.49)
-        self.assertTrue(np.allclose(out / k, irs))
+    def test_long_filter_tail_carries_over_blocks(self):
+        def fetch(az, el):                                # IR longer than two blocks
+            h = np.zeros((2, 1400))
+            h[:, 0] = 0.5
+            h[:, 1300] = 0.25
+            return h
+        n = 8 * B
+        x = np.zeros((n, 8))
+        x[:B, 2] = np.sin(np.arange(B) / 5) * 0.1
+        y = run(renderer(fetch=fetch), x)
+        ref = np.convolve(x[:, 2], fetch(0, 0)[0])[:n]
+        self.assertLess(np.max(np.abs(y[:, 0] - ref)), 1e-6)
+
+    def test_crossfade_has_no_discontinuity(self):
+        n = 40 * B
+        t = np.arange(n) / sr.RATE
+        x = np.zeros((n, 8))
+        x[:, 2] = 0.1 * np.sin(2 * np.pi * 1000 * t)
+        poses = [(7.0 * i, 0.0) for i in range(n // B)]   # the head jumps every block
+        r = renderer()
+        y = run(r, x, poses)
+        bound = 2 * np.pi * 1000 / sr.RATE * 0.1 * 0.9 * 1.3     # steepest slope of the signal
+        self.assertLess(np.max(np.abs(np.diff(y[B:], axis=0))), bound)
+        self.assertGreater(r.stats["iffts"], n // B)              # it did crossfade
+        # same run without the crossfade: the HRIR switch clicks (so the test can see a click)
+        r = renderer()
+        r._ramp = np.ones_like(r._ramp)
+        y = run(r, x, poses)
+        self.assertGreater(np.max(np.abs(np.diff(y[B:], axis=0))), 3 * bound)
+
+    def test_loudness_matches_dry_stereo(self):
+        rng = np.random.default_rng(5)
+        n = 60 * B
+        x = np.zeros((n, 8))
+        x[:, 0] = rng.normal(0, 0.05, n)
+        x[:, 1] = rng.normal(0, 0.05, n)
+        r = sr.Renderer(FakeHrtf(), None, intensity=1.0, dry_delay=0)   # automatic gain
+        y = run(r, x)
+        ratio = np.mean(y[B:] ** 2) / np.mean(x[B:, :2] ** 2)
+        self.assertAlmostEqual(ratio, 1.0, delta=0.08)
+
+    def test_intensity_mix(self):
+        rng = np.random.default_rng(7)
+        n = 6 * B
+        x = rng.normal(0, 0.02, (n, 8))
+        dry = sr.itu_downmix(x)
+        y0 = run(renderer(intensity=0.0, dry_delay=10), x)
+        self.assertLess(np.max(np.abs(y0[10:] - dry[:-10])), 1e-6)       # plain delayed downmix
+        self.assertLess(np.max(np.abs(y0[:10])), 1e-9)
+        y1 = run(renderer(intensity=1.0, dry_delay=10), x)
+        yh = run(renderer(intensity=0.5, dry_delay=10), x)
+        self.assertLess(np.max(np.abs(yh - 0.5 * (y0 + y1))), 1e-6)
+
+    def test_downmix(self):
+        x = np.zeros((1, 8))
+        x[0] = [1, 2, 3, 4, 5, 6, 7, 8]                   # FL FR FC LFE RL RR SL SR
+        c = math.sqrt(0.5)
+        left, right = sr.itu_downmix(x)[0]
+        self.assertAlmostEqual(left, 1 + c * 3 + c * 7 + c * 5 + 0.5 * 4)
+        self.assertAlmostEqual(right, 2 + c * 3 + c * 8 + c * 6 + 0.5 * 4)
+        st = np.zeros((3, 8))
+        st[:, :2] = [[0.1, -0.2], [0.3, 0.0], [0.0, 0.5]]
+        self.assertTrue(np.allclose(sr.itu_downmix(st), st[:, :2]))  # stereo passes through
+
+    def test_silence_is_skipped(self):
+        r = renderer()
+        x = np.zeros((B, 8))
+        x[:, 0] = 0.01
+        x[:, 1] = -0.01
+        r.process(x)
+        self.assertEqual(r.last_active, [0, 1])
+        self.assertEqual(r.stats["ffts"], 2)
+        for _ in range(5):                                 # tail rings out, then nothing at all
+            r.process(np.zeros((B, 8)))
+        ffts, iffts = r.stats["ffts"], r.stats["iffts"]
+        for _ in range(5):
+            y = r.process(np.zeros((B, 8)))
+            self.assertFalse(y.any())
+        self.assertEqual((r.stats["ffts"], r.stats["iffts"]), (ffts, iffts))
+
+    def test_lfe_no_hrtf_low_passed(self):
+        fetch = FakeHrtf()
+        r = renderer(fetch=fetch, dry_delay=40)
+        calls = fetch.calls
+        n = 10 * B
+        t = np.arange(n) / sr.RATE
+        x = np.zeros((n, 8))
+        x[:, 3] = 0.2 * np.sin(2 * np.pi * 50 * t) + 0.2 * np.sin(2 * np.pi * 5000 * t)
+        y = run(r, x)
+        self.assertEqual(fetch.calls, calls)                       # no HRIR for the LFE
+        self.assertTrue(np.allclose(y[:, 0], y[:, 1]))             # same in both ears
+        spec = np.abs(np.fft.rfft(y[2 * B:, 0]))
+        f = np.fft.rfftfreq(n - 2 * B, 1 / sr.RATE)
+        lo, hi = spec[np.argmin(np.abs(f - 50))], spec[np.argmin(np.abs(f - 5000))]
+        self.assertGreater(lo, 30 * hi)
+
+    def test_limiter_never_clips(self):
+        rng = np.random.default_rng(9)
+        n = 20 * B
+        x = np.zeros((n, 8))
+        x[:, 0] = rng.normal(0, 0.05, n)
+        x[5 * B:8 * B, 0] *= 60                            # sudden very loud part
+        r = renderer(gain_db=6.0)
+        y = run(r, x)
+        self.assertLess(np.max(np.abs(y)), 1.0)
+        self.assertGreater(r.stats["limited"], 0)
+        quiet = renderer()                                 # quiet signal: untouched
+        run(quiet, x[:4 * B] * 0.1)
+        self.assertEqual(quiet.stats["limited"], 0)
+
+    def test_hrir_cache(self):
+        fetch = FakeHrtf()
+        r = renderer(fetch=fetch)
+        x = np.zeros((B, 8))
+        x[:, 2] = 0.01
+        r.process(x, 0, 0)
+        calls = fetch.calls
+        for _ in range(5):
+            r.process(x, 0.3, 0.2)                          # same 1° cell
+        self.assertEqual(fetch.calls, calls)
+        r.process(x, 40, 0)
+        self.assertGreater(fetch.calls, calls)
+
+    def test_prepare_hrir(self):
+        h = np.ones((2, 3000))
+        out = sr.prepare_hrir(h, np.array([1.0, 1.0]), 1537)
+        self.assertEqual(out.shape, (2, 1537))
+        self.assertAlmostEqual(out[0, -1], 0.0)
+        self.assertAlmostEqual(out[0, 10], 2.0)
+
+
+class Containers(unittest.TestCase):
+    def reader(self, data):
+        pos = [0]
+
+        def read(n):
+            chunk = data[pos[0]:pos[0] + n]
+            pos[0] += len(chunk)
+            return chunk
+        return read
+
+    def test_raw_f32_roundtrip(self):
+        frames = np.array([[0.5, -0.25], [1.0, 0.0]])
+        data = sr.encode_f32(frames)
+        self.assertEqual(len(data), 16)
+        info, left = sr.read_stream_header(self.reader(data))
+        self.assertEqual(info["container"], "raw")
+        self.assertTrue(np.allclose(sr.decode_frames(left + data[4:], info["dtype"], 2), frames))
+
+    def test_au_header(self):
+        frames = np.array([[0.5, -0.25], [1.0, 0.0]])
+        data = (struct.pack(">4sIIIII", b".snd", 24, 0xFFFFFFFF, 6, 48000, 2)
+                + np.ascontiguousarray(frames, ">f4").tobytes())
+        info, left = sr.read_stream_header(self.reader(data))
+        self.assertEqual((info["container"], info["channels"], info["rate"]), ("au", 2, 48000))
+        self.assertEqual(left, b"")
+        self.assertTrue(np.allclose(sr.decode_frames(data[24:], info["dtype"], 2), frames))
+
+    def wav_header(self, tag=3, bits=32, ch=8, extensible=False):
+        if extensible:
+            fmt = struct.pack("<HHIIHHHHIH14s", 0xFFFE, ch, 48000, 48000 * ch * bits // 8, ch * bits // 8,
+                              bits, 22, bits, 0, tag, b"\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71")
+        else:
+            fmt = struct.pack("<HHIIHH", tag, ch, 48000, 48000 * ch * bits // 8, ch * bits // 8, bits)
+        return (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE" + b"fmt " + struct.pack("<I", len(fmt))
+                + fmt + b"LIST" + struct.pack("<I", 4) + b"abcd" + b"data" + struct.pack("<I", 0xFFFFFFFF))
+
+    def test_wav_float_stream(self):
+        frames = (np.arange(16, dtype=np.float32).reshape(2, 8) / 20)
+        for ext in (False, True):
+            data = self.wav_header(extensible=ext) + frames.astype("<f4").tobytes()
+            read = self.reader(data)
+            info, left = sr.read_stream_header(read)
+            self.assertEqual((info["container"], info["channels"], info["dtype"]), ("wav", 8, "<f4"))
+            self.assertTrue(np.allclose(sr.decode_frames(left + read(1000), info["dtype"], 8), frames))
+
+    def test_wav_pcm16_and_raw(self):
+        info, _ = sr.read_stream_header(self.reader(self.wav_header(tag=1, bits=16, ch=2)))
+        self.assertEqual(info["dtype"], "<i2")
+        self.assertAlmostEqual(sr.decode_frames(np.array([32767, -32767], "<i2").tobytes(), "<i2", 2)[0, 0], 1.0)
+        info, left = sr.read_stream_header(self.reader(b"\x00\x00\x80\x3f" * 8))
+        self.assertEqual(info["container"], "raw")
+        self.assertEqual(left, b"\x00\x00\x80\x3f")             # first bytes handed back
+        with self.assertRaises(EOFError):
+            sr.read_stream_header(self.reader(b"RIFF\x00"))
+
+
+class DiffuseField(unittest.TestCase):
+    def colored(self):
+        """60 directions x 2 ears of noisy IRs sharing a strong common resonance (~3 kHz)."""
+        rng = np.random.default_rng(1)
+        n = 400
+        t = np.arange(n) / sa.RATE
+        common = np.exp(-t * 900) * np.sin(2 * np.pi * 3000 * t)
+        common[0] += 0.3
+        irs = np.zeros((sa.N_DIRS, 2, n))
+        for d in range(sa.N_DIRS):
+            for e in (0, 1):
+                irs[d, e] = np.convolve(common, rng.normal(0, 1, 20) * np.exp(-np.arange(20) / 4))[:n]
+        return irs
+
+    def test_flattens(self):
+        irs = self.colored()
+        h = sa.diffuse_field_filter(irs)
+        out = np.apply_along_axis(lambda v: np.convolve(v, h), -1, irs)
+        f = np.fft.rfftfreq(4096, 1 / sa.RATE)
+        band = (f > 300) & (f < 12000)
+
+        def spread(a):
+            p = np.mean(np.abs(np.fft.rfft(a, 4096, axis=-1)) ** 2, axis=(0, 1))
+            ps = 10 * np.log10(sa._third_octave_smooth(f, p))
+            return ps[band].max() - ps[band].min()
+        self.assertLess(spread(out), spread(irs) - 6)
+
+    def test_filter_limits_and_minimum_phase(self):
+        h = sa.diffuse_field_filter(self.colored())
+        self.assertEqual(len(h), 256)
+        H = 20 * np.log10(np.abs(np.fft.rfft(h, 4096)))
+        f = np.fft.rfftfreq(4096, 1 / sa.RATE)
+        band = (f > 200) & (f < 15000)
+        self.assertLess(H[band].max() - H[band].min(), 24.5)
+        e = np.cumsum(h ** 2) / np.sum(h ** 2)
+        self.assertGreater(e[32], 0.8)
+
+    def test_flat_set_is_left_alone(self):
+        irs = np.zeros((4, 2, 64))
+        irs[:, :, 0] = 1.0
+        H = 20 * np.log10(np.abs(np.fft.rfft(sa.diffuse_field_filter(irs), 4096)))
+        self.assertLess(np.max(np.abs(H[10:-10])), 0.5)
 
 
 class FakeMysofa:
-    """Stands in for libmysofa: a 'click' whose level and position depend on the direction."""
+    """Stands in for libmysofa: a 'click' whose level and ear delay depend on the direction."""
     N = 16
 
     def __init__(self):
@@ -318,7 +365,7 @@ class FakeMysofa:
     def getfilter(self, h, n, x, y, z):
         self.asked.append((x, y, z))
         left, right = np.zeros(n), np.zeros(n)
-        left[2] = 1.0 + 0.5 * y / sa.SOFA_RADIUS          # louder in the left ear for y > 0 (left)
+        left[2] = 1.0 + 0.5 * y / sa.SOFA_RADIUS
         right[2] = 1.0 - 0.5 * y / sa.SOFA_RADIUS
         return left, right, (0.0 if y >= 0 else 3 / 48000), (3 / 48000 if y > 0 else 0.0)
 
@@ -327,106 +374,191 @@ class FakeMysofa:
 
 
 class Hrir(unittest.TestCase):
-    def test_extract_with_fake_library(self):
+    def test_sofa_hrtf_with_fake_library(self):
+        fake = FakeMysofa()
+        h = sa.SofaHrtf("/nope.sofa", 48000, fake)
+        pair = h(90, 0)
+        x, y, z = fake.asked[-1]
+        self.assertAlmostEqual(y, 1.2)                   # radius 1.2, y = left
+        self.assertAlmostEqual(x, 0.0)
+        self.assertAlmostEqual(pair[0, 2], 1.5)          # left ear: no delay
+        self.assertAlmostEqual(pair[1, 5], 0.5)          # right ear: 3 samples later
+        h(0, 30)
+        self.assertAlmostEqual(fake.asked[-1][2], 0.6)
+        h.close()
+        self.assertTrue(fake.closed)
+
+    def test_extract_and_eq_cache(self):
         fake = FakeMysofa()
         irs = sa.extract_hrirs("/nope.sofa", sa.DIRECTIONS, 48000, fake)
-        self.assertTrue(fake.closed)
         self.assertEqual(irs.shape[:2], (sa.N_DIRS, 2))
-        self.assertEqual(irs.shape[2], 6)               # click at 2, delayed by up to 3, tail trimmed
-        # coordinates: radius 1.2, x front, y left
-        x, y, z = fake.asked[idx(90, 0)]
-        self.assertAlmostEqual(y, 1.2)
-        self.assertAlmostEqual(x, 0.0)
-        x, y, z = fake.asked[idx(0, 30)]
-        self.assertAlmostEqual(z, 0.6)
-        left90 = irs[idx(90, 0)]
-        self.assertAlmostEqual(left90[0, 2], 1.5)       # left ear: no delay
-        self.assertAlmostEqual(left90[1, 5], 0.5)       # right ear: 3 samples later
-        self.assertEqual(left90[1, 2], 0.0)
-
-    def test_cache(self):
         d = tempfile.mkdtemp()
         sofa = os.path.join(d, "x.sofa")
         with open(sofa, "wb") as f:
             f.write(b"fake")
-        fake = FakeMysofa()
-        meta = sa.build_hrir_cache(sofa, os.path.join(d, "cache"), mysofa=fake)
-        self.assertEqual(len(meta["files"]), sa.N_DIRS)
-        self.assertTrue(all(os.path.exists(p) for p in meta["files"]))
-        y, rate = sa.read_wav(meta["files"][idx(0, 0)])
-        self.assertEqual(rate, 48000)
-        peak = max(np.max(np.abs(sa.read_wav(p)[0])) for p in meta["files"])
-        self.assertAlmostEqual(peak, 0.98, places=6)                               # one global peak
-        self.assertGreater(meta["factor"], 0)
+        h1 = sa.eq_for(sofa, d, mysofa=fake)
         n = len(fake.asked)
-        meta2 = sa.build_hrir_cache(sofa, os.path.join(d, "cache"), mysofa=fake)      # cached
+        h2 = sa.eq_for(sofa, d, mysofa=fake)             # cached: libmysofa not asked again
         self.assertEqual(len(fake.asked), n)
-        self.assertEqual(meta2["key"], meta["key"])
-        os.utime(sofa, ns=(1, 1))                                                    # new file
-        meta3 = sa.build_hrir_cache(sofa, os.path.join(d, "cache"), mysofa=fake)
-        self.assertNotEqual(meta3["key"], meta["key"])
-        self.assertEqual(len(fake.asked), 2 * n)
-        self.assertEqual(os.listdir(os.path.join(d, "cache")), [meta3["key"]])      # old cache gone
+        self.assertTrue(np.allclose(h1, h2))
+        os.utime(sofa, ns=(1, 1))                         # new file: rebuilt, old cache removed
+        sa.eq_for(sofa, d, mysofa=fake)
+        self.assertGreater(len(fake.asked), n)
+        self.assertEqual(len([p for p in os.listdir(d) if p.startswith("eq-")]), 1)
 
-    @unittest.skipUnless(os.path.exists(os.path.expanduser("~/.local/share/mousepods/hrtf/mit_kemar_normal_pinna.sofa")),
-                         "no MIT KEMAR file")
+    @unittest.skipUnless(os.path.exists(KEMAR), "no MIT KEMAR file")
     def test_real_libmysofa(self):
         try:
             lib = sa.Mysofa()
         except OSError:
             self.skipTest("no libmysofa")
-        path = os.path.expanduser("~/.local/share/mousepods/hrtf/mit_kemar_normal_pinna.sofa")
-        irs = sa.extract_hrirs(path, [(90, 0), (-90, 0), (0, 0)], 48000, lib)
-        e = np.sum(irs ** 2, axis=2)
-        self.assertGreater(e[0, 0], 3 * e[0, 1])         # +90 = left: left ear louder
-        self.assertGreater(e[1, 1], 3 * e[1, 0])
-        self.assertAlmostEqual(e[2, 0] / e[2, 1], 1.0, delta=0.2)
+        h = sa.SofaHrtf(KEMAR, 48000, lib)
+        try:
+            e = [np.sum(h(az, 0) ** 2, axis=1) for az in (90, -90, 0)]
+        finally:
+            h.close()
+        self.assertGreater(e[0][0], 3 * e[0][1])          # +90 = left: left ear louder
+        self.assertGreater(e[1][1], 3 * e[1][0])
+        self.assertAlmostEqual(e[2][0] / e[2][1], 1.0, delta=0.2)
 
 
-class DiffuseField(unittest.TestCase):
-    def colored(self):
-        """60 directions x 2 ears of noisy IRs sharing a strong common resonance (~3 kHz)."""
-        rng = np.random.default_rng(1)
-        n = 400
-        t = np.arange(n) / sa.RATE
-        common = np.exp(-t * 900) * np.sin(2 * np.pi * 3000 * t)       # ringing resonance
-        common[0] += 0.3
-        irs = np.zeros((sa.N_DIRS, 2, n))
-        for d in range(sa.N_DIRS):
-            for e in (0, 1):
-                irs[d, e] = np.convolve(common, rng.normal(0, 1, 20) * np.exp(-np.arange(20) / 4))[:n]
-        return irs
+class Commands(unittest.TestCase):
+    def test_sink(self):
+        c = sa.sink_command()
+        for part in ("create-node adapter {", "factory.name = support.null-audio-sink",
+                     'node.name = "mousepods_spatial"', 'node.description = "MousePods Spatial"',
+                     "media.class = Audio/Sink", "audio.channels = 8",
+                     "audio.position = [ FL FR FC LFE RL RR SL SR ]", "object.linger = false"):
+            self.assertIn(part, c)
+        self.assertNotIn("\n", c)
 
-    def band_spread(self, irs):
-        f = np.fft.rfftfreq(4096, 1 / sa.RATE)
-        p = np.mean(np.abs(np.fft.rfft(irs, 4096, axis=-1)) ** 2, axis=(0, 1))
-        ps = 10 * np.log10(sa._third_octave_smooth(f, p))
-        band = (f > 300) & (f < 12000)
-        return ps[band].max() - ps[band].min()
+    def test_capture(self):
+        c = sa.capture_command("mousepods_spatial")
+        self.assertEqual(c[0], "pw-record")
+        self.assertEqual(c[c.index("--target") + 1], "mousepods_spatial")
+        self.assertIn("stream.capture.sink = true", c[c.index("-P") + 1])
+        self.assertEqual(c[c.index("--format") + 1], "f32")
+        self.assertEqual(c[c.index("--channels") + 1], "8")
+        self.assertEqual(c[c.index("--rate") + 1], "48000")
+        self.assertEqual(c[-1], "-")
 
-    def test_flattens_and_keeps_loudness(self):
-        irs = self.colored()
-        out = sa.equalise(irs)
-        self.assertLessEqual(out.shape[-1], sa.MAX_IR)
-        self.assertLess(self.band_spread(out), self.band_spread(irs) - 6)
-        self.assertAlmostEqual(sa.pink_energy(out) / sa.pink_energy(irs), 1.0, places=6)
+    def test_playback_never_targets_itself(self):
+        c = sa.playback_command("bluez_output.40_DA_5C_BD_69_73.1")
+        self.assertEqual(c[c.index("--target") + 1], "bluez_output.40_DA_5C_BD_69_73.1")
+        props = c[c.index("-P") + 1]
+        self.assertIn("node.dont-reconnect = true", props)
+        self.assertEqual(c[c.index("--format") + 1], "f32")
+        self.assertEqual(c[c.index("--channels") + 1], "2")
+        self.assertNotIn("node.group", props)             # one group would stall the graph
+        self.assertEqual(c[-1], "-")
+        for bad in (None, "", "mousepods_spatial"):
+            with self.assertRaises(ValueError):
+                sa.playback_command(bad)
 
-    def test_filter_limits_and_minimum_phase(self):
-        h = sa.diffuse_field_filter(self.colored())
-        self.assertEqual(len(h), 256)
-        H = 20 * np.log10(np.abs(np.fft.rfft(h, 4096)))
-        f = np.fft.rfftfreq(4096, 1 / sa.RATE)
-        band = (f > 200) & (f < 15000)
-        self.assertLess(H[band].max() - H[band].min(), 24.5)            # +-12 dB around the centre
-        e = np.cumsum(h ** 2) / np.sum(h ** 2)
-        self.assertGreater(e[32], 0.8)                                    # energy at the start
 
-    def test_flat_set_is_left_alone(self):
-        irs = np.zeros((4, 2, 64))
-        irs[:, :, 0] = 1.0                                                # already flat
-        h = sa.diffuse_field_filter(irs)
-        H = 20 * np.log10(np.abs(np.fft.rfft(h, 4096)))
-        self.assertLess(np.max(np.abs(H[10:-10])), 0.5)
+class FakeProc:
+    def __init__(self, stdin=None, stdout=None):
+        self.stdin, self.stdout, self.pid = stdin, stdout, 999999
+        self.dead = False
+
+    def poll(self):
+        return 1 if self.dead else None
+
+
+class Plumbing(unittest.TestCase):
+    def service(self):
+        sp = sa.SpatialAudio({"make_default": False}, tempfile.mkdtemp())
+        sp.output = "alsa_output.speaker"
+        return sp
+
+    def test_set_pose_ignores_garbage(self):
+        sp = self.service()
+        sp.set_pose(float("nan"), 0)
+        sp.set_pose(None, 0)
+        self.assertEqual(sp._pose, (0.0, 0.0))
+        sp.set_pose(12, -3)
+        self.assertEqual(sp._pose, (12.0, -3.0))
+        st = sp.status()
+        self.assertFalse(st["active"])
+        for k in ("active", "output", "error", "output_present"):
+            self.assertIn(k, st)
+
+    def test_read_block_from_pipe(self):
+        sp = self.service()
+        r, w = os.pipe()
+        frames = np.random.default_rng(2).normal(0, 0.1, (2 * B, 8)).astype(np.float32)
+        hdr = Containers().wav_header()
+        os.write(w, hdr + frames[:B].astype("<f4").tobytes())
+        out = os.fdopen(r, "rb", buffering=0)
+        sp._rec = FakeProc(stdout=out)
+        sp._rec_info, sp._rec_left = sr.read_stream_header(out.read)
+        x = sp._read_block()
+        self.assertTrue(np.allclose(x, frames[:B]))
+        os.write(w, frames[B:].astype("<f4").tobytes())
+        os.close(w)
+        self.assertTrue(np.allclose(sp._read_block(), frames[B:]))
+        self.assertIsNone(sp._read_block())               # writer gone: end of stream
+        out.close()
+
+    def test_read_block_drops_backlog(self):
+        sp = self.service()
+        r, w = os.pipe()
+        sa._set_pipe_size(w, 1 << 20)
+        os.write(w, Containers().wav_header())
+        out = os.fdopen(r, "rb", buffering=0)
+        sp._rec = FakeProc(stdout=out)
+        sp._rec_info, sp._rec_left = sr.read_stream_header(out.read)
+        block = np.zeros((B, 8), "<f4").tobytes()
+        for _ in range(sa.MAX_PIPE_BLOCKS + 3):
+            os.write(w, block)
+        sp._read_block()
+        self.assertGreater(sp._dropped, 0)
+        self.assertLessEqual(sa.pipe_pending(r), sa.MAX_PIPE_BLOCKS * len(block))
+        os.close(w)
+        out.close()
+
+    def test_write_block_and_respawn_rules(self):
+        sp = self.service()
+        spawned = []
+
+        def fake_spawn():
+            r, w = os.pipe()
+            spawned.append(r)
+            sp._play = FakeProc(stdin=os.fdopen(w, "wb", buffering=0))
+            sp._last_play_spawn = 0.0
+        sp._spawn_play = fake_spawn
+        block = np.zeros((B, 2), np.float32)
+        sp._write_block(block)
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(sa.pipe_pending(spawned[0]), B * 2 * 4)
+        # output gone: no new pw-play
+        sp._play.dead = True
+        sp._output_present = False
+        sp._write_block(block)
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNone(sp._play)
+        # back: a new one
+        sp._output_present = True
+        sp._write_block(block)
+        self.assertEqual(len(spawned), 2)
+        # too much queued: the block is dropped instead of adding latency
+        for _ in range(sa.MAX_PIPE_BLOCKS + 1):
+            sp._play.stdin.write(sr.encode_f32(block))
+        before = sa.pipe_pending(spawned[1])
+        sp._write_block(block)
+        self.assertEqual(sa.pipe_pending(spawned[1]), before)
+        self.assertEqual(sp._dropped, 1)
+        sp._kill_play = lambda: None
+        for fd in spawned:
+            os.close(fd)
+
+    def test_pipe_pending(self):
+        r, w = os.pipe()
+        os.write(w, b"x" * 100)
+        self.assertEqual(sa.pipe_pending(r), 100)
+        self.assertEqual(sa.pipe_pending(w), 100)          # both ends on Linux
+        os.close(r)
+        os.close(w)
 
 
 class Sinks(unittest.TestCase):
@@ -434,10 +566,12 @@ class Sinks(unittest.TestCase):
         def node(i, name, cls="Audio/Sink"):
             return {"id": i, "type": "PipeWire:Interface:Node",
                     "info": {"props": {"node.name": name, "media.class": cls}}}
-        d = [node(1, "alsa_output.speaker"), node(2, sa.OWN_SINK),
+        d = [node(1, "alsa_output.speaker"), node(2, sa.OWN_SINK), node(5, "mousepods_spatial_test"),
              node(3, sa.OWN_OUTPUT, "Stream/Output/Audio")]
         if bluez:
             d.append(node(4, "bluez_output.40_DA_5C_BD_69_73.1"))
+        d.append({"id": 9, "type": "PipeWire:Interface:Link",
+                  "info": {"output-node-id": 3, "input-node-id": 1}})
         d.append({"id": 0, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
                   "metadata": [{"subject": 0, "key": "default.audio.sink", "type": "Spa:String:JSON",
                                 "value": {"name": default}},
@@ -456,11 +590,13 @@ class Sinks(unittest.TestCase):
         d = self.dump(default=sa.OWN_SINK, bluez=False)
         self.assertEqual(sa.find_output_sink(True, d), "alsa_output.speaker")
 
-    def test_metadata(self):
+    def test_metadata_nodes_links(self):
         d = self.dump()
         self.assertEqual(sa.default_metadata(d, "default.configured.audio.sink"), "alsa_output.speaker")
         self.assertEqual(sa.find_node(d, sa.OWN_SINK), 2)
         self.assertIsNone(sa.find_node(d, "nothing"))
+        self.assertTrue(sa.links_into(d, sa.OWN_OUTPUT, "alsa_output.speaker"))
+        self.assertFalse(sa.links_into(d, sa.OWN_OUTPUT, sa.OWN_SINK))
 
     def test_find_hrtf(self):
         d = tempfile.mkdtemp()
