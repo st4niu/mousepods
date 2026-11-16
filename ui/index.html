@@ -536,6 +536,7 @@ a.lrow:hover,button.lrow:hover{background:var(--line)}
       <label class="lt" for="hx-sp"><h2 id="hx-sp-h" data-i18n="v2.spatial">Spatial audio</h2><small id="hx-sp-st" data-i18n="v2.spatial_hint">The sound stays in place in the room while you turn your head</small></label>
       <label class="sw"><input type="checkbox" id="hx-sp" data-k="spatial_audio.enabled" aria-label="Spatial audio"><span></span></label></div>
     <div class="row"><button type="button" class="btn sm" data-spatial-test data-i18n="v2.spatial_test">Play a test sound</button><small class="hint" data-i18n="v2.spatial_test_hint">A chime walks around your head: turn your head while it plays.</small></div>
+    <div class="lrow set" style="padding:0"><label for="hx-sp-int" data-i18n-html="v2.spatial_intensity">Intensity<small>0 = plain stereo, 1 = full 3D</small></label><input type="range" id="hx-sp-int" data-k="spatial_audio.intensity" min="0" max="1" step="0.05"><output></output></div>
     <small class="hint" data-i18n="v2.spatial_how">Play anything (Spotify, YouTube, games) to the “MousePods Spatial” output: it becomes 3D in your AirPods and stays in front of your screen.</small>
   </section>
   <h2 class="sec" data-i18n="v2.try_it">Try it</h2>
@@ -638,6 +639,7 @@ a.lrow:hover,button.lrow:hover{background:var(--line)}
   <div class="card classic-gap">
     <div class="set toggle"><label data-i18n-html="v2.spatial_enable">Spatial audio<small>a virtual 7.1 output, rendered in 3D in your earbuds</small></label><label class="sw"><input type="checkbox" data-k="spatial_audio.enabled"><span></span></label></div>
     <div class="set toggle"><label data-i18n-html="v2.spatial_head">Head tracking<small>off: the sound turns with your head, like normal headphones</small></label><label class="sw"><input type="checkbox" data-k="spatial_audio.head_tracking"><span></span></label></div>
+    <div class="set"><label data-i18n-html="v2.spatial_intensity">Intensity<small>0 = plain stereo, 1 = full 3D</small></label><input type="range" data-k="spatial_audio.intensity" min="0" max="1" step="0.05"><output></output></div>
     <div class="set"><label data-i18n-html="v2.spatial_width">Width<small>angle of the front speakers, degrees</small></label><input type="range" data-k="spatial_audio.width" min="10" max="60" step="1"><output></output></div>
     <div class="set toggle"><label data-i18n-html="v2.spatial_default">Use it as the default output<small>the previous output comes back when spatial audio is off</small></label><label class="sw"><input type="checkbox" data-k="spatial_audio.make_default"><span></span></label></div>
     <div class="kv"><span data-i18n="v2.spatial_test_label">Test</span><span><button type="button" class="btn sm" data-spatial-test data-i18n="v2.spatial_test">Play a test sound</button></span></div>

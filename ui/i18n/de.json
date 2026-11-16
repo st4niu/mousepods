@@ -1045,6 +1045,7 @@
  "v2.spatial_head": "Kopf-Tracking<small>aus: der Klang dreht sich mit dem Kopf, wie bei normalen Kopfhörern</small>",
  "v2.spatial_hint": "Der Klang bleibt im Raum stehen, wenn du den Kopf drehst",
  "v2.spatial_how": "Spiel irgendetwas (Spotify, YouTube, Spiele) über den Ausgang „MousePods Spatial“ ab: Der Klang wird in den AirPods dreidimensional und bleibt vor dem Bildschirm.",
+ "v2.spatial_intensity": "Intensität<small>0 = normales Stereo, 1 = volles 3D</small>",
  "v2.spatial_on": "An · Ausgabe über {output}",
  "v2.spatial_test": "Testton abspielen",
  "v2.spatial_test_err": "Testton konnte nicht abgespielt werden",

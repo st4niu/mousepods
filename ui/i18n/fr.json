@@ -1045,6 +1045,7 @@
  "v2.spatial_head": "Suivi de tête<small>désactivé : le son tourne avec la tête, comme un casque normal</small>",
  "v2.spatial_hint": "Le son reste fixe dans la pièce quand tu tournes la tête",
  "v2.spatial_how": "Joue n'importe quoi (Spotify, YouTube, jeux) sur la sortie « MousePods Spatial » : le son devient 3D dans tes AirPods et reste devant ton écran.",
+ "v2.spatial_intensity": "Intensité<small>0 = stéréo normale, 1 = 3D complète</small>",
  "v2.spatial_on": "Activé · sort sur {output}",
  "v2.spatial_test": "Tester le son",
  "v2.spatial_test_err": "Impossible de jouer le son de test",

@@ -1045,6 +1045,7 @@
  "v2.spatial_head": "Head tracking<small>off: the sound turns with your head, like normal headphones</small>",
  "v2.spatial_hint": "The sound stays in place in the room while you turn your head",
  "v2.spatial_how": "Play anything (Spotify, YouTube, games) to the “MousePods Spatial” output: it becomes 3D in your AirPods and stays in front of your screen.",
+ "v2.spatial_intensity": "Intensity<small>0 = plain stereo, 1 = full 3D</small>",
  "v2.spatial_on": "On · plays through {output}",
  "v2.spatial_test": "Play a test sound",
  "v2.spatial_test_err": "Could not play the test sound",

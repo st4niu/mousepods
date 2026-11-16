@@ -143,7 +143,8 @@ DEFAULTS = {
     "headsets": {"enabled": True, "mouse": True, "px_per_deg": 22.0},
     # head-tracked spatial audio (spatial_audio.py): a virtual 7.1 output rendered with an HRTF onto
     # the AirPods, whose speakers stay in place while the head turns
-    "spatial_audio": {"enabled": False, "head_tracking": True, "width": 30.0, "make_default": True},
+    "spatial_audio": {"enabled": False, "head_tracking": True, "width": 30.0, "make_default": True,
+                      "intensity": 0.75},
     "opentrack": {"enabled": False, "host": "127.0.0.1", "port": 4242, "rate_hz": 120,
                   "invert_yaw": False, "invert_pitch": False, "invert_roll": False,
                   "scale_yaw": 1.0, "scale_pitch": 1.0, "scale_roll": 1.0, "smoothing": 0.2,
@@ -1207,7 +1208,10 @@ class Controller:
             ot.feed_angles(yaw, pitch, roll, dt, yaw_rate)
             sp = self.spatial
             if sp is not None and ot.pose:
-                sp.set_pose(ot.pose[3], ot.pose[4])
+                if self.cfg.get("spatial_audio", {}).get("head_tracking", True):
+                    sp.set_pose(ot.pose[3], ot.pose[4])
+                else:
+                    sp.set_pose(0.0, 0.0)              # head tracking off: the scene turns with the head
         hc = self.cfg.get("headsets", {})
         prev = self._hs_last.get(name)
         self._hs_last[name] = (yaw, pitch)
@@ -1273,6 +1277,9 @@ class Controller:
                     log.info("Spatial audio: off")
                 return
             if sp and getattr(self, "_spatial_key", None) == key:
+                r = getattr(sp, "renderer", None)          # intensity changes live, no restart
+                if r is not None:
+                    r.intensity = min(max(float(sa.get("intensity", 0.75)), 0.0), 1.0)
                 return
             if sp:                                    # settings that need a new graph
                 sp.stop()
@@ -1513,7 +1520,10 @@ class Controller:
                     (p["pitch_sign"], p["roll_sign"], p["yaw_sign"]), att)
             sp = self.spatial
             if sp is not None and ot.pose:
-                sp.set_pose(ot.pose[3], ot.pose[4])
+                if self.cfg.get("spatial_audio", {}).get("head_tracking", True):
+                    sp.set_pose(ot.pose[3], ot.pose[4])
+                else:
+                    sp.set_pose(0.0, 0.0)              # head tracking off: the scene turns with the head
             if self.calibration is not None:
                 head = ot.head()
                 if head is not None:
