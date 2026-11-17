@@ -178,6 +178,31 @@ from "walking around". MousePods decodes it in `parse_meta()` and shows it as `a
 telemetry (`tests/test_motion_meta.py` checks it against the recordings). The same 58-byte block is
 used by AirPods Pro over SensorDataWX, so the fields are probably there too (not checked yet).
 
+## 13. What Apple's public HID code says about the unknown services
+
+No public source names `kadabra`, `mando`, `neorelay` or `iedrelay` (web, code search and iOS
+binary string diffs checked, November 2026). Apple's open-source HID code still explains part of the
+descriptors:
+
+- In Apple's HID usage tables, page `0xFF00` usage `0x23` is a vendor **Message** collection and
+  `0x25` a vendor **Payload** ([AppleHIDUsageTables.h](https://raw.githubusercontent.com/acidanthera/MacKernelSDK/master/Headers/IOKit/hid/AppleHIDUsageTables.h)).
+  So `kadabra` (`0xFF00:0x23`) is a message whose 64-bit field is probably a Bluetooth remote timestamp,
+  and `iedrelay` (`0xFF00:0x25`) carries an opaque payload. Page `0xFF0C` is Apple's motion page
+  (Activity, DeviceMotion6…), page `0xFF0A` heart rate.
+- Apple's `HIDSensorTimeFilter` and `HIDSensorControlFilter` match `Transport = "BT-AACP"`, i.e.
+  exactly these RemoteHID services, and map their 64-bit remote timestamps to host time
+  ([IOHIDFamily plug-ins](https://github.com/apple-oss-distributions/IOHIDFamily/tree/main/IOHIDEventSystemPlugIns)).
+- iOS 26's `heartratecoordinatord` logs "AACP HR … conf … loc … gen": **AirPods Pro 3 heart rate travels
+  over the same RemoteHID channel** ([ipsw-diffs](https://github.com/blacktop/ipsw-diffs/blob/main/iOS/26_0_23A5336a__vs_26_0_23A340/MACHOS/heartratecoordinatord.md)).
+- CoreMotion's headphone activity states are static, pedestrian, walking, running and "other moving"
+  ([ipsw-diffs, iOS 18.4](https://github.com/blacktop/ipsw-diffs/blob/main/iOS/18_3_1_22D72__vs_18_4_22E5200s/DYLIBS/CoreMotion.md));
+  the public `CMHeadphoneActivityManager` delivers `CMMotionActivity` (stationary / walking / running…,
+  confidence 0–2). The motion state of §12 and the `cma` service are probably the earbud side of this.
+  Apple lists AirPods Pro 2 and AirPods 4 for that API, not AirPods 3.
+
+Inferences, not verified: `iedrelay` = in-ear detection data; `mando` / `neorelay` = fragmented relay
+channels (between buds or for diagnostics).
+
 ## Not isolated yet (honest list)
 
 - Whether the Apple PnP DeviceID (`bluetooth:004C:…`) and the re-pair are needed. We changed it **before** the first success, together with the MTU; the MTU alone may be enough. **To test.**
