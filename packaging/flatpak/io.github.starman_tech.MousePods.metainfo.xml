@@ -35,7 +35,7 @@
   </screenshots>
   <!-- newest first; a release tag needs an entry with a description (release_notes.py check) -->
   <releases>
-    <release version="1.5.0" date="2026-11-16">
+    <release version="1.5.0" date="2026-11-17">
       <description>
         <p>Spatial audio with head tracking.</p>
         <ul>
