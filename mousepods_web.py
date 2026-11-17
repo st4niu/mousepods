@@ -749,6 +749,9 @@ class WebUI:
             "gestures": self._gest_summary(),
             "speech": self.speech.as_dict() if self.speech else None,
             "pose": self._pose(),
+            # the earbuds' own motion state and energy (docs/DISCOVERIES.md §12)
+            "activity": (getattr(ctl, "last_meta", None) or {}).get("motion_state"),
+            "motion_energy": (getattr(ctl, "last_meta", None) or {}).get("motion_energy"),
             "spatial": self.ctl.spatial_status() if hasattr(self.ctl, "spatial_status") else None,
         }
 

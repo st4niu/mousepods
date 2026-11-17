@@ -28,6 +28,7 @@ Tested on: AirPods 3, firmware marketing version `6296592`, Ubuntu 24.04, BlueZ 
 | 9 | Units of the 58-byte motion block: gyro ≈ 0.122 °/s per LSB, gravity and user acceleration ≈ 1000 per g | ✅ measured | Partly new (layout was known, the scales were not) |
 | 10 | Power behaviour: sensors **off in the case**, fused stream **frozen** when a bud lies still out of the ear, streams **cancelled** when the primary bud changes, proximity flapping when a bud is held | ✅ observed | **NEW** |
 | 11 | The "per-connection service ID" of the `0x800` announcements is a **generation counter**, and the "constant bytes" are the sub-packet header | ✅ verified | **NEW** (corrects an open question in the dissector) |
+| 12 | The 58-byte motion block carries the earbuds' **own motion state** (still / fidget / moving), a motion energy, a sample counter and the earbuds' clock | ✅ verified on labelled recordings | **NEW** |
 
 ---
 
@@ -147,10 +148,41 @@ The byte that "changes on every connection" is the generation counter. The two "
 
 ---
 
+## 12. Inside the 58-byte block: the earbuds' own motion state
+
+Public decoders read the quaternion, gyro, user acceleration and gravity of the 58-byte block and
+skip the rest. Correlating the other bytes with our labelled recordings (`captures/gestures_labeled.json`:
+silence, talking, chewing, teeth clicks, nods, shakes, tilts; `captures/cma_walk.json`: sitting,
+standing, walking, jogging) gives this layout (AirPods 3, devmotion6 at ~45 Hz):
+
+| Bytes | Type | Meaning | Evidence |
+|---|---|---|---|
+| 0 | u8 | always 1 | constant |
+| 1–8 | u64 | timestamp, ns | known |
+| 9 | u8 | always 3 | constant |
+| 10 | u8 | flag, 0 or 4 | 4 is more frequent when still; meaning not isolated |
+| **11** | u8 | **motion state computed by the earbuds**: `0x43` still, `0x83` small motion, `0x03` moving | silence 0x43 ≈ 78 %; talking / chewing 0x83 > 80 %; walking 0x03 75 %, jogging 0x03 90 %; standing 0x43 55 % |
+| 12–15 | u32 | **earbuds' clock**, ~0.9 MHz | +19 870 ticks per block, linear |
+| 16–19 | — | zero | constant |
+| 20–25 | 3 × int16 | attitude, Q15 vector part | known |
+| 26–31 | 3 × int16 | gyro, ~0.122 °/s per LSB | known (§9) |
+| 32–37 | 3 × int16 | one value repeated three times, rising **linearly** by ~2.15 per second | correlation with time 1.00 in every recording; a slow clock or counter, not a temperature |
+| 38–43 | 3 × int16 | user acceleration, ~1000 per g | known (§9) |
+| 44–49 | 3 × int16 | gravity, ~1000 per g | known (§9) |
+| **50–53** | float32 | **motion energy**: ~1e-5 at rest, ~1.7e-4 talking / chewing, ~1e-3 shaking, ~6e-2 walking | log-correlation with the gyro rate 0.77–0.80 |
+| **54–55** | u16 | **sample counter**, +4 per block, wraps at 65 536 | the IMU runs 4× faster than the fused stream; a bigger jump means lost samples |
+| 56–57 | — | zero | constant |
+
+The motion state is presumably what Apple's spatial audio uses to tell "head still at the desk"
+from "walking around". MousePods decodes it in `parse_meta()` and shows it as `activity` in the live
+telemetry (`tests/test_motion_meta.py` checks it against the recordings). The same 58-byte block is
+used by AirPods Pro over SensorDataWX, so the fields are probably there too (not checked yet).
+
 ## Not isolated yet (honest list)
 
 - Whether the Apple PnP DeviceID (`bluetooth:004C:…`) and the re-pair are needed. We changed it **before** the first success, together with the MTU; the MTU alone may be enough. **To test.**
-- The meaning of `kadabra`, `mando`, `neorelay` and `iedrelay` reports, and of feature reports 2–4.
+- The meaning of `kadabra`, `mando`, `neorelay`, `iedrelay` and `cma` reports, and of feature reports 2–4: none of them has sent a single input report in our recordings so far (`cma` and `iedrelay` were never started).
+- Byte 10 of the motion block (0 / 4).
 - Whether other AirPods models with older firmware (AirPods 2, AirPods Pro 1) also use RemoteHID.
 
 ## Reproduce

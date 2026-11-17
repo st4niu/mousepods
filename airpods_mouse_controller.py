@@ -653,6 +653,23 @@ def parse_block(blk, dps_per_lsb=0.122):
     return ts, (w[0] * dps_per_lsb, w[1] * dps_per_lsb, w[2] * dps_per_lsb), (float(g[0]), float(g[1]), float(g[2]))
 
 
+# Fields of the 58-byte block that no public decoder used (docs/DISCOVERIES.md §12), found by
+# correlating labelled AirPods 3 recordings: byte 11 is the earbuds' own motion state.
+MOTION_STATES = {0x43: "still", 0x83: "fidget", 0x03: "moving"}
+
+
+def parse_meta(blk):
+    """Extra fields of a 58-byte block: the earbuds' motion state (still / fidget / moving), a
+    motion energy (float, ~1e-5 at rest, ~1e-2 walking), a sample counter (+4 per block at ~50 Hz,
+    wraps at 65536: a jump shows lost samples) and the earbuds' own clock (u32, ~0.9 MHz)."""
+    state = blk[11]
+    return {"motion_state": MOTION_STATES.get(state, f"0x{state:02x}"),
+            "motion_energy": struct.unpack_from("<f", blk, 50)[0],
+            "counter": struct.unpack_from("<H", blk, 54)[0],
+            "sensor_clock": struct.unpack_from("<I", blk, 12)[0],
+            "flags": blk[10]}
+
+
 def parse_accel(blk):
     """Accélération utilisateur (gravité retirée), repère corps, en m/s² (~1000 unités = 1 g)."""
     a = struct.unpack_from("<hhh", blk, 38)
@@ -1531,6 +1548,8 @@ class Controller:
             dt = min(max(now - self.last_sample, 0.001), 0.05) if self.last_sample else 0.01
         self.last_ts, self.last_sample = ts, now
         self.n += 1
+        if len(blk) >= 56:
+            self.last_meta = parse_meta(blk)
         a = parse_accel(blk)
         self.last_acc = a
         yaw, pitch, roll = self.engine.step(w, g, dt)
