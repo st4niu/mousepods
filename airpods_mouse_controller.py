@@ -325,6 +325,8 @@ STEM_TYPES = {0x05: "single", 0x06: "double", 0x07: "triple", 0x08: "long"}
 #         3 SetReport, 4 GetReport, 5 DeviceConfirmConnect.
 RHID_PREFIX = H("04000400170000080000")
 RHID_CONNECT, RHID_INPUT, RHID_SET, RHID_GET = 0, 2, 3, 4
+RHID_DEFAULT_NAMES = {1: "kadabra", 2: "mando", 3: "neorelay", 4: "accel", 5: "gyro", 6: "cma",
+                      7: "devmotion6", 8: "iedrelay"}     # AirPods 3 order; the plist name wins
 HID_FEATURE = 2
 
 
@@ -421,6 +423,78 @@ def ear_place(pkt):
     return "out"
 
 
+# AAP status messages read for the Labo "AirPods data" card (docs/DISCOVERIES.md §14). Opcode names
+# from LibrePods' unreleased android/rewrite branch; MAC addresses are never kept.
+BUD_ROLES = {0x01: "left", 0x02: "right"}
+AUDIO_SOURCES = {0x00: "none", 0x01: "call", 0x02: "media"}
+LOCATION_SIDES = {1: "right", 2: "left"}     # observed on AirPods 3 (the BUD_ROLE switch says which)
+
+
+def aap_status(pkt):
+    """AAP packet -> {field: value} for bud role (0x08), audio source (0x0E) and connected
+    devices (0x2E); {} for anything else."""
+    if pkt[:4] != HDR or len(pkt) < 7:
+        return {}
+    op = pkt[4] | pkt[5] << 8
+    if op == 0x08:
+        return {"primary_bud": BUD_ROLES.get(pkt[6], "headset")}
+    if op == 0x0E and len(pkt) >= 13:
+        t = pkt[12]
+        return {"audio_source": AUDIO_SOURCES.get(t, f"0x{t:02x}")}
+    if op == 0x2E and len(pkt) >= 9:
+        return {"connected_devices": pkt[8]}
+    return {}
+
+
+def device_info(plist_xml):
+    """RemoteHID DeviceConnect plist -> service name, LocationID, masked serial, config, PRXC."""
+    import plistlib
+    try:
+        d = plistlib.loads(plist_xml)
+    except Exception:
+        return {}
+    serial = d.get("SerialNumber")
+    if isinstance(serial, bytes):
+        serial = serial.rstrip(b"\0").decode(errors="replace")
+    cfg = d.get("CFG#")
+    if isinstance(cfg, bytes):
+        cfg = cfg.rstrip(b"\0").decode(errors="replace")
+    return {"service": d.get("AccessoryService"), "location": d.get("LocationID"),
+            "serial": ("…" + serial[-4:]) if serial else None, "config": cfg,
+            "proximity_calibration": "PRXC" in d}
+
+
+def airpods_info(aap, ctl):
+    """Everything MousePods reads from the AirPods beyond the head motion (Labo card)."""
+    meta = getattr(ctl, "last_meta", None) or {}
+    st = getattr(ctl, "link", None) or {}
+    n, lost = st.get("samples", 0), st.get("lost", 0)
+    if aap is None:
+        return {"connected": False}
+    names = {v: k for k, v in aap.rhid_devs.items()}
+    services = [{"id": d, "name": names.get(d) or n_, "announced": d in names,
+                 "input_reports": aap.rhid_counts.get(d, 0)}
+                for d, n_ in sorted(RHID_DEFAULT_NAMES.items())]
+    now = time.monotonic()
+    recent = [t for t in list(getattr(ctl, "sample_times", []))[-200:] if now - t < 2.0]
+    return {
+        "connected": aap.sock is not None,
+        "motion_state": meta.get("motion_state"),
+        "motion_energy": meta.get("motion_energy"),
+        "motion_bud": aap.loc_sides.get(aap.motion_loc),
+        "primary_bud": aap.status.get("primary_bud"),
+        "link": {"samples": n, "lost": lost,
+                 "loss_pct": round(100.0 * lost / (n + lost), 2) if n + lost else 0.0,
+                 "rate_hz": round(len(recent) / 2.0, 1)},
+        "sensor_clock_hz": round(st["clock_hz"]) if st.get("clock_hz") else None,
+        "audio_source": aap.status.get("audio_source"),
+        "connected_devices": aap.status.get("connected_devices"),
+        "buds": [{"location": loc, "side": aap.loc_sides.get(loc), **b}
+                 for loc, b in sorted(aap.buds.items())],
+        "services": services,
+    }
+
+
 class NoAirPodsConnected(OSError):
     """No paired AirPods are connected (errno 112, as before)."""
 
@@ -460,6 +534,10 @@ class AAPClient:
         self.imu_kinds = {}          # dev -> "a" | "w" : flux IMU bruts demandés par les gestes
         self.imu_reports = []        # [(kind, payload)] en attente pour Controller.raw_imu_hooks
         self.on_raw = None           # callback(direction, paquet)
+        self.status = {}             # aap_status() fields, last value of each
+        self.buds = {}               # LocationID -> device_info() of a bud (sensor services)
+        self.motion_loc = None       # LocationID of the bud that sends the head motion
+        self.loc_sides = dict(LOCATION_SIDES)
 
     def _pick(self):
         if self.want != "auto":
@@ -569,6 +647,15 @@ class AAPClient:
                 if kind == RHID_CONNECT and b"<?xml" in pl:
                     m = re.search(rb"AccessoryService</key><string>(\w+)", pl)
                     self.rhid_plist[dev] = pl
+                    di = device_info(pl)
+                    loc = di.get("location")
+                    if loc is not None and di.get("serial"):
+                        self.buds[loc] = {k: di[k] for k in ("serial", "config", "proximity_calibration")}
+                    if di.get("service") == "devmotion6" and loc is not None:
+                        role = self.status.get("primary_bud")
+                        if role in ("left", "right") and self.motion_loc not in (None, loc):
+                            self.loc_sides[loc] = role          # the switch just told us the side
+                        self.motion_loc = loc
                     if m:
                         name = m.group(1).decode()
                         new = name not in self.rhid_devs
@@ -592,6 +679,8 @@ class AAPClient:
                     self.rhid_replies.append((time.monotonic(), kind, dev, pl))
                     del self.rhid_replies[:-50]
             return blocks
+        if pkt[:4] == HDR and len(pkt) >= 7:
+            self.status.update(aap_status(pkt))
         if pkt[:4] == HDR and len(pkt) >= 8:
             if pkt[4] == 0x06:
                 self.place = ear_place(pkt)
@@ -1549,7 +1638,9 @@ class Controller:
         self.last_ts, self.last_sample = ts, now
         self.n += 1
         if len(blk) >= 56:
-            self.last_meta = parse_meta(blk)
+            meta = parse_meta(blk)
+            self._link_feed(getattr(self, "last_meta", None), meta, now)
+            self.last_meta = meta
         a = parse_accel(blk)
         self.last_acc = a
         yaw, pitch, roll = self.engine.step(w, g, dt)
@@ -1587,6 +1678,21 @@ class Controller:
             self.on_glide(vsub(w, self.engine.bias), g, a, dt, now, q)
         else:
             self.on_rates(yaw, pitch, roll, dt, now)
+
+    def _link_feed(self, prev, meta, now):
+        """Link quality from the block counter (+4 per block): a bigger step = blocks lost on the
+        way. Also estimates the earbuds' clock rate against the host clock."""
+        st = self.__dict__.setdefault("link", {"samples": 0, "lost": 0, "clk": None})
+        st["samples"] += 1
+        if prev is not None:
+            step = (meta["counter"] - prev["counter"]) % 65536
+            if 4 < step < 4000 and step % 4 == 0:
+                st["lost"] += step // 4 - 1
+        clk = st["clk"]
+        if clk is None or now - clk[0] > 30 or meta["sensor_clock"] < clk[1]:
+            st["clk"] = (now, meta["sensor_clock"])
+        elif now - clk[0] > 2:
+            st["clock_hz"] = (meta["sensor_clock"] - clk[1]) / (now - clk[0])
 
     def on_glide(self, wc, g, a, dt, now, q=None):
         c = self.cfg

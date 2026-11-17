@@ -29,6 +29,7 @@ Tested on: AirPods 3, firmware marketing version `6296592`, Ubuntu 24.04, BlueZ 
 | 10 | Power behaviour: sensors **off in the case**, fused stream **frozen** when a bud lies still out of the ear, streams **cancelled** when the primary bud changes, proximity flapping when a bud is held | ✅ observed | **NEW** |
 | 11 | The "per-connection service ID" of the `0x800` announcements is a **generation counter**, and the "constant bytes" are the sub-packet header | ✅ verified | **NEW** (corrects an open question in the dissector) |
 | 12 | The 58-byte motion block carries the earbuds' **own motion state** (still / fidget / moving), a motion energy, a sample counter and the earbuds' clock | ✅ verified on labelled recordings | **NEW** |
+| 14 | When the primary bud changes, the head motion moves to **the other bud, whose sensor axes are mirrored** (gravity X flips sign); the re-announced services carry each bud's side (`LocationID`), serial, factory configuration and a per-bud `PRXC` table | ✅ observed (one session) | **NEW** |
 
 ---
 
@@ -202,6 +203,47 @@ descriptors:
 
 Inferences, not verified: `iedrelay` = in-ear detection data; `mando` / `neorelay` = fragmented relay
 channels (between buds or for diagnostics).
+
+## 14. What a primary-bud switch shows (AirPods 3, November 2026)
+
+Guided recording, one earbud taken out then put back, each side in turn. When the bud that streams
+the motion leaves the ear, the AirPods send, within 30 ms:
+
+| Message | Content | Source of the name |
+|---|---|---|
+| AAP `0x06` | ear state (known) | LibrePods |
+| AAP `0x08` | **bud role**: byte 6 = `01` left primary, `02` right primary | LibrePods, `android/rewrite` branch |
+| AAP `0x04` | battery (known) | LibrePods |
+| AAP `0x0C` | a Bluetooth address (stored reversed) + 2 bytes; one per switch, plus the host's | LibrePods (`MAC_ADDRESS` / `TIPI_3`) |
+| AAP `0x0E` | **audio source**: address + type (`00` none, `01` call, `02` media) | LibrePods |
+| AAP `0x2E` | **connected devices**: count, then address + 2 unknown bytes per device | LibrePods |
+| RemoteHID kind 0 ×8 | every service re-announced (DeviceConnect plists) | this document |
+
+The re-announced plists carry fields that the first announcement already had but that only make sense
+across a switch:
+
+- `LocationID` changes: **1 = right bud, 2 = left bud** (matched with the `0x08` role in the same burst).
+- The sensor services (`accel`, `gyro`, `cma`, `devmotion6`) carry each bud's own **`SerialNumber`** and
+  **`CFG#`** (Apple's SysCfg "configuration number", e.g. `X2055/MP/…/*/*`).
+- `kadabra` and `iedrelay` carry **`PRXC`**, 74 bytes that differ between the two buds: a header and ten
+  6-byte entries, keyed by 20000, 23000, 28000, 30000 and 36000 (twice) with a measured value each.
+  Apple's SysCfg has a `PxCl` key named "Proximity Calibration"; `PRXC` is probably the in-ear
+  proximity sensor's factory calibration. Not verified.
+
+**The two buds' sensors are mirrored.** With the head still, the fused gravity of `devmotion6` reads
+about (−0.35, −0.89, −0.35) g on the right bud and (+0.33, −0.91, −0.31) g on the left one: X flips,
+Y and Z stay. The raw `accel` service shows the same. A head calibration made on one bud is
+therefore not valid on the other one. Yaw (rotation about gravity) is unaffected; the pitch and roll
+axes are. Every recording in `captures/` before this one was made on the right bud.
+
+The gyro bias of the two buds differs by less than 0.5 °/s: the automatic bias tracking copes with
+it. MousePods shows the bud that streams the motion, the role, the audio source, the number of
+connected devices, both buds' masked serials and the link quality on the Labo page. It never keeps
+the addresses.
+
+Sent on press only, not seen here: stem presses (AAP `0x19`) arrive only after
+`09 00 39 0F` and give the **type** of press (single, double, triple, long). No message seen so far
+carries a press force.
 
 ## Not isolated yet (honest list)
 

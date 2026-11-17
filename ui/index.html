@@ -168,6 +168,24 @@ code{background:var(--card2);padding:1px 6px;border-radius:5px}
 .cue .pb i{display:block;height:100%;background:var(--accent);width:0}
 .cue.go .t{color:var(--green)}.cue.rest .t{color:var(--text2)}
 .exp{color:var(--orange);font-weight:600}
+/* Labo: AirPods data card */
+#apd h3{flex-wrap:wrap}#apd h3 .pill{margin-left:auto}
+.apd-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:28px}
+.apd-cols>div{min-width:0}
+@media (max-width:760px){.apd-cols{grid-template-columns:1fr}.apd-cols>div:first-child>.kv:last-child{border-bottom:1px solid var(--line)}}
+.apd-en{display:inline-flex;align-items:center;gap:10px;min-width:0}
+.apd-bar{display:block;width:min(120px,28vw);flex:none}
+.apd-bar i{left:0;width:100%;transform-origin:0 50%;transform:scaleX(0);transition:transform .3s}
+.apd-sec{font-size:13px;font-weight:600;color:var(--text2);margin:16px 0 2px;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px}
+.apd-sec .hint{font-weight:400}
+.apd-tw{overflow-x:auto;max-width:100%}
+.apd-tw th,.apd-tw td{white-space:nowrap}
+.apd-tw .empty{padding:14px}
+.apd-tw td{vertical-align:middle;padding-top:6px;padding-bottom:6px}.apd-tw .pill{padding:1px 8px}
+#apd .kv{flex-wrap:wrap;row-gap:4px}#apd .kv>span{min-width:0;overflow-wrap:anywhere}
+#apd .apd-silent td{color:var(--text2)}
+.apd-note{margin-top:12px}
+#apd .pill.g{color:var(--green)}#apd .pill.o{color:var(--orange)}#apd .pill.b{color:var(--accent)}#apd .apd-warn{color:var(--orange)}
 </style>
 <style id="skin-adw">
 /* GNOME (libadwaita) look, MousePods orange. Light and dark follow the system unless
@@ -443,6 +461,24 @@ a.lrow:hover,button.lrow:hover{background:var(--line)}
 .lrow input[type=range]{max-width:220px}
 .ok-text{color:var(--green)}
 .lrow.set{display:grid;grid-template-columns:1fr minmax(120px,220px) 56px;min-height:56px;padding:8px 16px}
+/* Labo: AirPods data card */
+#apd h3{flex-wrap:wrap}#apd h3 .pill{margin-left:auto}
+.apd-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:28px}
+.apd-cols>div{min-width:0}
+@media (max-width:760px){.apd-cols{grid-template-columns:1fr}.apd-cols>div:first-child>.kv:last-child{border-bottom:1px solid var(--sep)}}
+.apd-en{display:inline-flex;align-items:center;gap:10px;min-width:0}
+.apd-bar{display:block;width:min(120px,28vw);flex:none}
+.apd-bar i{left:0;width:100%;transform-origin:0 50%;transform:scaleX(0);transition:transform .3s}
+.apd-sec{font-size:13px;font-weight:600;color:var(--text2);margin:16px 0 2px;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px}
+.apd-sec .hint{font-weight:400}
+.apd-tw{overflow-x:auto;max-width:100%}
+.apd-tw th,.apd-tw td{white-space:nowrap}
+.apd-tw .empty{padding:14px}
+.apd-tw td{vertical-align:middle;padding-top:6px;padding-bottom:6px}.apd-tw .pill{padding:1px 8px}
+#apd .kv{flex-wrap:wrap;row-gap:4px}#apd .kv>span{min-width:0;overflow-wrap:anywhere}
+#apd .apd-silent td{color:var(--text2)}
+.apd-note{margin-top:12px}
+#apd .pill.g{color:var(--green)}#apd .pill.o{color:var(--orange)}#apd .pill.b{color:var(--accent-text)}#apd .apd-warn{color:var(--orange)}
 </style>
 <script id="look-boot">
 // apply the saved look before the first paint (no flash); the server's config takes over once loaded
@@ -786,6 +822,28 @@ a.lrow:hover,button.lrow:hover{background:var(--line)}
 
 <section class="page" id="p-labo">
   <h1 data-i18n="labo.lab">Labo</h1><div class="sub" data-i18n="labo.live_measurements_and_guided_sessions_th">Mesures en direct et sessions guidées. Détecteur du Labo volontairement permissif (seuil 0,15 m/s² + seuil adaptatif 3 × bruit) : il montre aussi les claquements trop doux pour le seuil réel. Les consignes s'affichent en grand à l'écran (pas de notifications).</div>
+  <div class="card classic-gap" id="apd" role="region" aria-labelledby="apd-title">
+    <h3><span id="apd-title" data-i18n="v2.apd.title">AirPods data</span><span class="pill" id="apd-conn" role="status">—</span></h3>
+    <div class="apd-cols">
+      <div>
+        <div class="kv"><span data-i18n="v2.apd.motion_state">Motion, as the earbuds see it</span><span class="pill" id="apd-state" role="status">—</span></div>
+        <div class="kv"><span id="apd-en-l" data-i18n="v2.apd.motion_energy">Motion energy</span><span class="apd-en"><span class="bar apd-bar" id="apd-meter" role="meter" aria-labelledby="apd-en-l" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="—"><i id="apd-en-bar"></i></span><span class="mono" id="apd-en">—</span></span></div>
+        <div class="kv"><span data-i18n="v2.apd.link">Bluetooth link</span><span id="apd-link">—</span></div>
+        <div class="kv"><span data-i18n="v2.apd.clock">Earbuds' clock</span><span class="mono" id="apd-clock">—</span></div>
+      </div>
+      <div>
+        <div class="kv"><span data-i18n="v2.apd.motion_bud">Head motion from</span><span id="apd-mbud">—</span></div>
+        <div class="kv"><span data-i18n="v2.apd.primary_bud">Primary earbud</span><span id="apd-pbud">—</span></div>
+        <div class="kv"><span data-i18n="v2.apd.audio">Audio source</span><span id="apd-audio">—</span></div>
+        <div class="kv"><span data-i18n="v2.apd.devices">Connected devices</span><span id="apd-ndev">—</span></div>
+      </div>
+    </div>
+    <h4 class="apd-sec" id="apd-buds-h" data-i18n="v2.apd.buds">Earbuds</h4>
+    <div class="apd-tw"><table aria-labelledby="apd-buds-h"><thead><tr><th data-i18n="v2.apd.bud">Earbud</th><th data-i18n="v2.apd.serial">Serial</th><th data-i18n="v2.apd.config">Configuration</th><th data-i18n="v2.apd.prox">Proximity calibration</th></tr></thead><tbody id="apd-buds"><tr><td colspan="4" class="empty">—</td></tr></tbody></table></div>
+    <h4 class="apd-sec"><span id="apd-svc-h" data-i18n="v2.apd.services">RemoteHID services</span> <span class="hint" id="apd-svc-sum"></span></h4>
+    <div class="apd-tw"><table aria-labelledby="apd-svc-h"><thead><tr><th data-i18n="v2.apd.id">ID</th><th data-i18n="v2.apd.name">Name</th><th data-i18n="v2.apd.announced">Announced</th><th data-i18n="v2.apd.reports">Input reports</th></tr></thead><tbody id="apd-svc"><tr><td colspan="4" class="empty">—</td></tr></tbody></table></div>
+    <p class="hint apd-note" data-i18n-html="v2.apd.note">Read-only. Found by MousePods (<a href="https://github.com/starman-tech/mousepods/blob/main/docs/DISCOVERIES.md" target="_blank" rel="noopener">docs/DISCOVERIES.md §12–14</a>)</p>
+  </div>
   <div class="grid g3">
     <div class="card"><h3 data-i18n="labo.signal">Signal</h3>
       <div class="kv"><span data-i18n="labo.source">Source</span><span id="lb-src">—</span></div>
@@ -1128,7 +1186,7 @@ function pageTitle(p){const n=$(`#nav a[data-p="${p}"] span[data-i18n]`)||$(`#na
 function setAdvanced(open){$("#nav").classList.toggle("adv-open",open);$("#nav-adv-toggle").setAttribute("aria-expanded",String(open))}
 $("#nav-adv-toggle").onclick=()=>setAdvanced(!$("#nav").classList.contains("adv-open"));
 function onPage(p){setText($("#pb-title"),pageTitle(p));if($(`#nav-adv a[data-p="${p}"]`))setAdvanced(true);
-  if(p==="overview"&&LOOK.skin==="adwaita"){if(prevPage==="games")heroGamesAt=0;loadHeroGames()}if(p==="settings")loadAutostart()}
+  if(p==="overview"&&LOOK.skin==="adwaita"){if(prevPage==="games")heroGamesAt=0;loadHeroGames()}if(p==="settings")loadAutostart();apdSync()}
 window.addEventListener("load",()=>{const h=location.hash.slice(1);if(h&&document.getElementById("p-"+h))go(h)});
 // ---------- commandes
 $$("[data-cmd]").forEach(b=>b.onclick=()=>{post("/api/cmd",{cmd:b.dataset.cmd});toast(b.textContent)});
@@ -1394,6 +1452,43 @@ function lbPoll(){fetch("/api/labo"+(lbT!==null?"?since="+lbT:"")).then(r=>r.jso
   renderLabo(d)}).catch(()=>{})}
 function lbStartPoll(){if(!lbTimer)lbTimer=setInterval(()=>{const s=lbData&&lbData.session;if(page==="labo"||(s&&!s.done))lbPoll()},100)}
 lbStartPoll();
+// ---------- Labo: AirPods data (read-only, GET /api/airpods/info once a second, only while the Labo page is shown)
+var apdTimer=null,apdBusy=false;
+const APD_STATE={still:["v2.apd.still","pill g"],fidget:["v2.apd.fidget","pill o"],moving:["v2.apd.moving","pill b"]};
+const APD_SIDE={left:"v2.apd.left",right:"v2.apd.right",headset:"v2.apd.headset"};
+const APD_AUDIO={none:"v2.apd.audio_none",call:"v2.apd.audio_call",media:"v2.apd.audio_media"};
+const apdNum=v=>typeof v==="number"&&isFinite(v);
+// a known value is translated, an unknown one ("0x2a") is shown as sent, a missing one as a dash
+const apdWord=(map,v)=>v===null||v===undefined||v===""?"—":map[v]?t(map[v]):String(v);
+const apdYes=v=>v===true?t("v2.apd.yes"):v===false?t("v2.apd.no"):"—";
+function apdHz(v){return !apdNum(v)?"—":v>=1e6?(v/1e6).toFixed(3)+" MHz":v>=1e3?(v/1e3).toFixed(1)+" kHz":v.toFixed(1)+" Hz"}
+function renderApd(d){const ok=!!d&&typeof d==="object",c=ok&&d.connected===true;d=ok?d:{};
+  const cp=$("#apd-conn");setText(cp,!ok?t("v2.apd.no_data"):c?t("v2.apd.connected"):t("v2.apd.not_connected"));setClass(cp,c?"pill g":"pill");
+  const st=APD_STATE[d.motion_state],se=$("#apd-state");setText(se,st?t(st[0]):apdWord({},d.motion_state));setClass(se,st?st[1]:"pill");
+  // energy on a log scale: 1e-6 (empty) .. 1e-1 (full); ~1e-5 at rest, ~1e-2 walking
+  const e=d.motion_energy,has=apdNum(e)&&e>0,f=has?Math.min(1,Math.max(0,(Math.log10(e)+6)/5)):0;
+  const bar=$("#apd-en-bar"),sx="scaleX("+f.toFixed(3)+")";if(bar._sx!==sx){bar._sx=sx;bar.style.transform=sx}
+  const et=has?e.toExponential(1):apdNum(e)?"0":"—",m=$("#apd-meter");setText($("#apd-en"),et);
+  setAttr(m,"aria-valuenow",String(Math.round(f*100)));setAttr(m,"aria-valuetext",et);
+  const L=d.link&&typeof d.link==="object"?d.link:{},lk=$("#apd-link"),lp=apdNum(L.loss_pct),lr=apdNum(L.rate_hz);
+  setText(lk,lp||lr?t("v2.apd.link_fmt",{lost:lp?L.loss_pct.toFixed(1):"—",hz:lr?L.rate_hz.toFixed(1):"—"}):"—");
+  setClass(lk,lp&&L.loss_pct>=5?"apd-warn":"");
+  setAttr(lk,"title",apdNum(L.samples)?t("v2.apd.link_counts",{lost:apdNum(L.lost)?L.lost:0,samples:L.samples}):"");
+  setText($("#apd-clock"),apdHz(d.sensor_clock_hz));
+  setText($("#apd-mbud"),apdWord(APD_SIDE,d.motion_bud));setText($("#apd-pbud"),apdWord(APD_SIDE,d.primary_bud));
+  setText($("#apd-audio"),apdWord(APD_AUDIO,d.audio_source));setText($("#apd-ndev"),apdNum(d.connected_devices)?String(d.connected_devices):"—");
+  const none=`<tr><td colspan="4" class="empty">${esc(ok?t("v2.apd.nothing"):"—")}</td></tr>`;
+  const buds=Array.isArray(d.buds)?d.buds:[];
+  setHtml($("#apd-buds"),buds.length?buds.map(b=>`<tr><td>${esc(b.side?apdWord(APD_SIDE,b.side):b.location!=null?"#"+b.location:"—")}</td><td class="mono">${esc(b.serial||"—")}</td><td class="mono">${esc(b.config||"—")}</td><td>${esc(apdYes(b.proximity_calibration))}</td></tr>`).join(""):none);
+  const sv=Array.isArray(d.services)?d.services:[];let talk=0;
+  setHtml($("#apd-svc"),sv.length?sv.map(s=>{const n=apdNum(s.input_reports)?s.input_reports:null,quiet=n===0;if(n>0)talk++;
+    return `<tr${quiet?' class="apd-silent"':""}><td class="mono">${esc(s.id!=null?s.id:"—")}</td><td class="mono">${esc(s.name||"—")}</td><td>${esc(apdYes(s.announced))}</td><td>${n===null?"—":quiet?`<span class="pill">${esc(t("v2.apd.silent"))}</span>`:n}</td></tr>`}).join(""):none);
+  setText($("#apd-svc-sum"),sv.length?t("v2.apd.services_sum",{n:talk,total:sv.length}):"")}
+function apdPoll(){if(apdBusy)return;apdBusy=true;
+  fetch("/api/airpods/info").then(r=>r.ok?r.json():null).then(renderApd,()=>renderApd(null)).catch(()=>{}).finally(()=>{apdBusy=false})}
+function apdSync(){const on=page==="labo"&&!document.hidden;
+  if(on&&!apdTimer){apdTimer=setInterval(apdPoll,1000);apdPoll()}else if(!on&&apdTimer){clearInterval(apdTimer);apdTimer=null}}
+document.addEventListener("visibilitychange",apdSync);
 const lcv=$("#lb-chart"),lcx=lcv.getContext("2d");
 function drawLabo(L,real){const W=lcv.clientWidth,H=240,dpr=devicePixelRatio||1;if(lcv.width!==W*dpr){lcv.width=W*dpr;lcv.height=H*dpr}
   lcx.setTransform(dpr,0,0,dpr,0,0);lcx.clearRect(0,0,W,H);const css=getComputedStyle(document.documentElement),cv=n=>css.getPropertyValue(n);

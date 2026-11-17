@@ -949,6 +949,8 @@ class WebUI:
                     d["stats"] = g.buf.stats()
                     d["config"] = ui.ctl.cfg.get("gestures", {})
                     self._json(d)
+                elif self.path == "/api/airpods/info":      # Labo: everything read beyond the motion
+                    self._json(m.airpods_info(ui.aap, ui.ctl))
                 elif self.path == "/api/labo":
                     try:
                         since = float(qs["since"][0]) if "since" in qs else None
