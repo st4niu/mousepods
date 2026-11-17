@@ -456,6 +456,32 @@ class Commands(unittest.TestCase):
                 sa.playback_command(bad)
 
 
+class RawFlagTests(unittest.TestCase):
+    def setUp(self):
+        sa._RAW_FLAG.clear()
+        self.addCleanup(sa._RAW_FLAG.clear)
+
+    def _help(self, text):
+        from unittest import mock
+        res = mock.Mock(stdout=text, stderr="")
+        return mock.patch.object(sa.subprocess, "run", return_value=res)
+
+    def test_new_pipewire_gets_raw(self):
+        with self._help("  -a, --raw                             RAW mode\n"):
+            c = sa.playback_command("bluez_output.x")
+        self.assertIn("--raw", c)
+        self.assertEqual(c[-1], "-")
+
+    def test_old_pipewire_has_no_raw(self):
+        with self._help("  -h, --help  Show this help\n"):
+            self.assertNotIn("--raw", sa.playback_command("bluez_output.x"))
+
+    def test_missing_tool_is_not_fatal(self):
+        from unittest import mock
+        with mock.patch.object(sa.subprocess, "run", side_effect=OSError):
+            self.assertEqual(sa.raw_flag("pw-play"), [])
+
+
 class FakeProc:
     def __init__(self, stdin=None, stdout=None):
         self.stdin, self.stdout, self.pid = stdin, stdout, 999999

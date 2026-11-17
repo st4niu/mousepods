@@ -421,6 +421,22 @@ def capture_command(sink=OWN_SINK):
             "--channel-map", ",".join(CHANNELS), "--format", "f32", "--latency", str(BLOCK), "-"]
 
 
+_RAW_FLAG = {}
+
+
+def raw_flag(tool="pw-play"):
+    """["--raw"] when this pw-play reads raw samples only with it. PipeWire 1.2.4 reads raw f32 from
+    "-" and has no --raw; newer ones (1.6.8 in the GNOME 50 runtime) open "-" with libsndfile, fail
+    on raw data and exit at once: no sound at all, and no error to show."""
+    if tool not in _RAW_FLAG:
+        try:
+            r = subprocess.run([tool, "--help"], capture_output=True, text=True, timeout=5)
+            _RAW_FLAG[tool] = ["--raw"] if "--raw" in (r.stdout + r.stderr) else []
+        except (OSError, subprocess.SubprocessError):
+            _RAW_FLAG[tool] = []
+    return _RAW_FLAG[tool]
+
+
 def playback_command(output, sink=OWN_SINK):
     """pw-play of the binaural stereo (raw f32 on stdin) onto `output`, never onto our own sink."""
     if not output or output == sink:
@@ -428,8 +444,8 @@ def playback_command(output, sink=OWN_SINK):
     props = (f"{{ node.name = {_q(sink + '.output')} node.description = {_q(DESCRIPTION + ' (output)')} "
              f"node.dont-reconnect = true "
              f"application.name = {_q(DESCRIPTION)} media.role = Music }}")
-    return ["pw-play", "--target", output, "-P", props, "--rate", str(RATE), "--channels", "2",
-            "--format", "f32", "--latency", str(BLOCK), "-"]
+    return ["pw-play", *raw_flag("pw-play"), "--target", output, "-P", props, "--rate", str(RATE),
+            "--channels", "2", "--format", "f32", "--latency", str(BLOCK), "-"]
 
 
 def pipe_pending(fd):
