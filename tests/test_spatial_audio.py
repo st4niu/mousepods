@@ -482,6 +482,45 @@ class RawFlagTests(unittest.TestCase):
             self.assertEqual(sa.raw_flag("pw-play"), [])
 
 
+class FollowOutputTests(unittest.TestCase):
+    """Spatial audio started before the AirPods connected must move onto them."""
+
+    def engine(self, output, auto=True):
+        from unittest import mock
+        e = sa.SpatialAudio({}, tempfile.mkdtemp())
+        e.output, e._auto_output, e._output_present = output, auto, True
+        e._kill_play = mock.Mock()
+        return e
+
+    def follow(self, e, best, present=True):
+        from unittest import mock
+        with mock.patch.object(sa, "find_output_sink", return_value=best):
+            return e._follow_output({}, present)
+
+    def test_moves_from_speakers_to_airpods(self):
+        e = self.engine("alsa_output.speaker")
+        self.assertTrue(self.follow(e, "bluez_output.40_DA_5C_BD_69_73.1"))
+        self.assertEqual(e.output, "bluez_output.40_DA_5C_BD_69_73.1")
+        e._kill_play.assert_called_once()
+
+    def test_stays_when_already_on_airpods_or_nothing_better(self):
+        e = self.engine("bluez_output.a")
+        self.assertFalse(self.follow(e, "bluez_output.b"))       # another headset: keep ours
+        self.assertFalse(self.follow(e, "bluez_output.a"))
+        e = self.engine("alsa_output.speaker")
+        self.assertFalse(self.follow(e, "alsa_output.hdmi"))     # no AirPods: no reason to move
+
+    def test_falls_back_when_the_output_goes(self):
+        e = self.engine("bluez_output.a")
+        self.assertTrue(self.follow(e, "alsa_output.speaker", present=False))
+        self.assertEqual(e.output, "alsa_output.speaker")
+
+    def test_an_output_chosen_in_the_settings_is_kept(self):
+        e = self.engine("alsa_output.speaker", auto=False)
+        self.assertFalse(self.follow(e, "bluez_output.a"))
+        self.assertEqual(e.output, "alsa_output.speaker")
+
+
 class FakeProc:
     def __init__(self, stdin=None, stdout=None):
         self.stdin, self.stdout, self.pid = stdin, stdout, 999999

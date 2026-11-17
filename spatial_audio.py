@@ -589,6 +589,7 @@ class SpatialAudio:
         if not out or out == self.sink:
             raise RuntimeError("no output sink to render onto")
         self.output = out
+        self._auto_output = not (output_sink or self.cfg.get("output"))
         # the sink: lives as long as this pw-cli
         self._sink_cli = subprocess.Popen(["pw-cli"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                           stderr=subprocess.DEVNULL, start_new_session=True)
@@ -782,11 +783,29 @@ class SpatialAudio:
             log.warning("spatial audio: output was linked into its own sink, stopping it")
             self._kill_play()
         present = find_node(dump, self.output) is not None
+        if self._follow_output(dump, present):
+            return
         if present != self._output_present:
             self._output_present = present
             self.error = None if present else f"output {self.output} is gone"
             if not present:
                 self._kill_play()
+
+    def _follow_output(self, dump, present):
+        """With no output chosen in the settings, follow the AirPods: move onto a Bluetooth sink
+        that appears (spatial audio started before they connected stayed on the speakers, so the
+        AirPods got nothing), and onto the next best sink when ours goes away."""
+        if not getattr(self, "_auto_output", False):
+            return False
+        best = find_output_sink(True, dump)
+        if not best or best == self.output or best == self.sink:
+            return False
+        if present and not (best.startswith("bluez_output.")
+                            and not (self.output or "").startswith("bluez_output.")):
+            return False
+        log.info("spatial audio: output %s -> %s", self.output, best)
+        self.set_output(best)
+        return True
 
     # ---- default sink
     def _make_default(self, dump):
