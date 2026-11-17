@@ -35,6 +35,14 @@
   </screenshots>
   <!-- newest first; a release tag needs an entry with a description (release_notes.py check) -->
   <releases>
+    <release version="1.6.1" date="2026-11-17">
+      <description>
+        <p>Spatial audio plays again.</p>
+        <ul>
+          <li>Spatial audio: no sound reached the AirPods since the Flatpak runtime update (newer PipeWire tools); fixed</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.6.0" date="2026-11-17">
       <description>
         <p>Everything MousePods reads from your AirPods, on the Labo page.</p>
