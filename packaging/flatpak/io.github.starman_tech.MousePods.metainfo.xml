@@ -35,6 +35,17 @@
   </screenshots>
   <!-- newest first; a release tag needs an entry with a description (release_notes.py check) -->
   <releases>
+    <release version="1.6.0" date="2026-11-17">
+      <description>
+        <p>Everything MousePods reads from your AirPods, on the Labo page.</p>
+        <ul>
+          <li>Labo: a new "AirPods data" card shows what the earbuds themselves think of your motion (still, small movements, moving), the Bluetooth link quality, which earbud sends the head motion, the primary earbud, the audio source and the connected devices</li>
+          <li>Both earbuds' serial numbers (masked) and the hidden RemoteHID services, with the ones that stay silent</li>
+          <li>Read-only, no Bluetooth address is kept</li>
+          <li>Overview: the spatial audio card sits under the pictures again</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.5.0" date="2026-11-17">
       <description>
         <p>Spatial audio with head tracking.</p>
